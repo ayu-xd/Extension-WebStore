@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DMDroid</title>
+  <style>
+    @font-face { font-family:'Roboto'; font-weight:400; font-style:normal;
+      src:url('fonts/roboto-400.woff') format('woff'); }
+    @font-face { font-family:'Roboto'; font-weight:700; font-style:normal;
+      src:url('fonts/roboto-700.woff') format('woff'); }
+
+    :root {
+      --bg:        #141414;
+      --card:      #1d1d1d;
+      --line:      rgba(255,255,255,.14);
+      --line-soft: rgba(255,255,255,.07);
+      --text:      #ffffff;
+      --muted:     rgba(255,255,255,.72);
+      --primary:   #1976D2;
+      --danger:    #e53935;
+      --radius:    4px;
+    }
+    * { box-sizing:border-box; margin:0; padding:0; font-family:'Roboto',-apple-system,'Segoe UI',sans-serif; }
+    html,body { width:360px; background:var(--bg); color:var(--text); }
+    .view { padding-bottom:6px; }
+
+    .hidden { display:none !important; }
+    .view { padding:18px 16px; }
+
+    /* ── top bar ── */
+    .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
+    .brand  { font-weight:700; font-size:15px; letter-spacing:.04em; user-select:none; cursor:default; }
+    .icon-btn { background:none; border:none; color:var(--muted); font-size:19px; cursor:pointer;
+                padding:4px 6px; border-radius:var(--radius); line-height:1; }
+    .icon-btn:hover { color:var(--text); background:rgba(255,255,255,.06); }
+
+    /* ── stat cards (ColdDMs anatomy) ── */
+    .cards { display:flex; gap:12px; margin-bottom:20px; }
+    .qcard { flex:1; background:var(--card); border-radius:var(--radius); padding:18px 10px 22px; text-align:center; }
+    .card-label { font-size:13px; color:var(--muted); }
+    .sep { border:none; height:1px; background:var(--line); width:72%; margin:12px auto 16px; }
+    .card-num  { font-size:40px; line-height:1; }
+
+    /* ── engine toggle ── */
+    .full-btn { width:100%; padding:15px 0; border:none; border-radius:var(--radius);
+      font-size:14px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
+      cursor:pointer; transition:background .15s ease, opacity .15s ease; }
+    .full-btn.running { background:var(--primary); color:#fff; }
+    .full-btn.running:hover { background:#1e88e5; }
+    .full-btn.paused  { background:#263238; color:#b0bec5; }
+    .full-btn.paused:hover  { background:#2e3b43; }
+
+    /* ── messages ── */
+    .message { min-height:18px; font-size:12.5px; margin-top:12px; color:var(--muted); }
+    .message.error { color:var(--danger); }
+
+    /* ── login ── */
+    .form-group { margin-bottom:14px; }
+    .form-group label { display:block; font-size:12px; color:var(--muted); margin-bottom:6px; }
+    input { width:100%; padding:11px 12px; background:#0f0f0f; color:var(--text);
+      border:1px solid var(--line-soft); border-radius:var(--radius); font-size:14px; outline:none; }
+    input:focus { border-color:var(--primary); }
+    .primary-btn { width:100%; padding:12px 0; background:var(--primary); color:#fff;
+      border:none; border-radius:var(--radius); font-size:14px; font-weight:700; cursor:pointer; }
+    .primary-btn:disabled { opacity:.55; cursor:default; }
+
+    /* ── connecting / link state ── */
+    .center-note { text-align:center; padding:30px 6px 10px; font-size:13.5px; color:var(--muted); }
+
+    /* ── gear sheet ── */
+    .sheet-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:9; }
+    .sheet { position:fixed; right:0; top:0; bottom:0; width:86%; max-width:340px;
+      background:var(--card); z-index:10; padding:16px 18px 26px; overflow-y:auto;
+      border-left:1px solid var(--line-soft); }
+    .sheet-head { display:flex; align-items:center; gap:12px; margin-bottom:8px; }
+    .sheet-title { font-weight:700; font-size:14.5px; }
+    .sheet h3 { font-size:11.5px; letter-spacing:.09em; text-transform:uppercase;
+      color:var(--muted); font-weight:700; margin:26px 0 14px; }
+    .img-card { background:rgba(255,255,255,.04); border:1px solid var(--line-soft);
+      border-radius:var(--radius); padding:14px; }
+    .hint { font-size:11.5px; color:var(--muted); line-height:1.5; margin-bottom:12px; }
+    .soft-btn { width:100%; padding:10px 8px; background:rgba(255,255,255,.07); color:var(--text);
+      border:none; border-radius:var(--radius); font-size:13px; cursor:pointer; }
+    .soft-btn:hover { background:rgba(255,255,255,.11); }
+    .soft-btn.danger { color:var(--danger); }
+    .img-meta { font-size:12px; color:var(--muted); margin:10px 2px; }
+    .row-btn { display:flex; align-items:center; gap:11px; width:100%; padding:13px 10px;
+      background:transparent; border:none; color:var(--text); font-size:14px;
+      border-radius:var(--radius); cursor:pointer; text-align:left; }
+    .row-btn:hover { background:rgba(255,255,255,.06); }
+    .mini-icon { font-size:15px; width:20px; text-align:center; opacity:.85; }
+    #settingsMessage { min-height:0; margin:8px 2px 0; }
+
+    /* ── logs overlay (hidden behind gesture) ── */
+    .logs-topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+    .logs-controls { display:flex; gap:8px; align-items:center; margin-bottom:10px; }
+    #debugLogs { height:420px; overflow-y:auto; background:#0c0c0c; border:1px solid var(--line-soft);
+      border-radius:var(--radius); padding:10px; font-family:'Consolas','Courier New',monospace;
+      font-size:11px; line-height:1.55; color:#c8d6e5; word-break:break-all; }
+    .text-btn { background:none; border:none; color:var(--muted); font-size:12px; cursor:pointer; padding:6px; }
+    .text-btn:hover { color:var(--text); }
+    .text-btn.off { opacity:.45; }
+  </style>
+</head>
+<body>
+
+  <!-- ══════════ LOGIN ══════════ -->
+  <section id="loginView" class="view hidden">
+    <div class="topbar"><span class="brand">DMDroid</span></div>
+    <div class="form-group">
+      <label for="email">Email</label>
+      <input type="email" id="email" placeholder="Your account email" autocomplete="email">
+    </div>
+    <div class="form-group">
+      <label for="password">Password</label>
+      <input type="password" id="password" placeholder="Your password" autocomplete="current-password">
+    </div>
+    <button id="loginBtn" class="primary-btn">Login</button>
+    <div id="loginMessage" class="message"></div>
+  </section>
+
+  <!-- ══════════ CONNECTING / RECONNECT ══════════ -->
+  <section id="selectView" class="view hidden">
+    <div class="topbar"><span class="brand">DMDroid</span></div>
+    <p class="center-note" id="selectMessage"></p>
+    <button id="connectBtn" class="primary-btn hidden">Reconnect Engine</button>
+  </section>
+
+  <!-- ══════════ MAIN (single screen) ══════════ -->
+  <section id="activeView" class="view hidden">
+    <div class="topbar">
+      <span class="brand" id="brandTitle">DMDroid</span>
+      <button id="gearBtn" class="icon-btn" title="Settings" aria-label="Settings">&#9881;</button>
+    </div>
+
+    <div class="cards">
+      <div class="qcard">
+        <div class="card-label">Sent today</div>
+        <hr class="sep">
+        <div class="card-num" id="sentTodayDisplay">0</div>
+      </div>
+      <div class="qcard">
+        <div class="card-label">Pending today</div>
+        <hr class="sep">
+        <div class="card-num" id="pendingTodayDisplay">0</div>
+      </div>
+    </div>
+
+    <button id="engineToggleBtn" class="full-btn running">Press to stop</button>
+  </section>
+
+  <!-- ══════════ GEAR SHEET ══════════ -->
+  <div id="sheetBackdrop" class="sheet-backdrop hidden"></div>
+  <aside id="gearSheet" class="sheet hidden">
+    <div class="sheet-head">
+      <button id="backBtn" class="icon-btn" title="Back">&#8592;</button>
+      <span class="sheet-title">Settings</span>
+    </div>
+
+    <h3>Actions</h3>
+    <button id="downloadLogsBtn" class="row-btn"><span class="mini-icon">&#11015;</span> Download logs</button>
+    <button id="logoutBtn" class="row-btn danger"><span class="mini-icon">&#8617;</span> Logout</button>
+    <div id="settingsMessage" class="message"></div>
+
+    <h3>Image Manager</h3>
+    <div class="img-card">
+      <p class="hint">Upload images named by username (e.g., santeena.jpg) to auto-attach them to that person's DMs.</p>
+      <input type="file" id="imageUploadInput" multiple accept="image/*" style="display:none">
+      <button id="selectImagesBtn" class="soft-btn">Select Images</button>
+      <div class="img-meta">Loaded&nbsp;<b id="imageCountDisplay">0</b></div>
+      <button id="clearImagesBtn" class="soft-btn danger">Clear All Images</button>
+    </div>
+  </aside>
+
+  <!-- ══════════ LOGS OVERLAY (gesture-gated) ══════════ -->
+  <section id="logsOverlay" class="view hidden">
+    <div class="logs-topbar">
+      <span class="brand">Logs</span>
+      <button id="logsCloseBtn" class="icon-btn" title="Close">&#10005;</button>
+    </div>
+    <div class="logs-controls">
+      <button id="autoScrollToggle" class="text-btn" aria-pressed="true">Auto-scroll: on</button>
+      <button id="clearLogsBtn" class="text-btn">Clear logs</button>
+    </div>
+    <div id="debugLogs"></div>
+  </section>
+
+  <script src="../assets/imageStorage.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
