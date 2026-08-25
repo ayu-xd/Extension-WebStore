@@ -64,6 +64,9 @@
     .primary-btn { width:100%; padding:12px 0; background:var(--primary); color:#fff;
       border:none; border-radius:var(--radius); font-size:14px; font-weight:700; cursor:pointer; }
     .primary-btn:disabled { opacity:.55; cursor:default; }
+    .link-btn { background:none; border:none; color:var(--muted); font-size:12px;
+      cursor:pointer; margin-top:12px; text-decoration:underline; text-underline-offset:2px; }
+    .link-btn:hover { color:var(--text); }
 
     /* ── connecting / link state ── */
     .center-note { text-align:center; padding:30px 6px 10px; font-size:13.5px; color:var(--muted); }
@@ -117,6 +120,7 @@
       <input type="password" id="password" placeholder="Your password" autocomplete="current-password">
     </div>
     <button id="loginBtn" class="primary-btn">Login</button>
+    <button id="forgotLink" class="link-btn">Forgot password?</button>
     <div id="loginMessage" class="message"></div>
   </section>
 

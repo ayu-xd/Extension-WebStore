@@ -3,6 +3,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const $ = id => document.getElementById(id);
   const loginView = $('loginView'), selectView = $('selectView'), activeView = $('activeView');
   const loginBtn = $('loginBtn'), connectAppBtn = null;
+  const forgotLink = $('forgotLink');
   const connectBtn = $('connectBtn'), logoutBtn = $('logoutBtn'), disconnectBtn = null;
   const emailInput = $('email'), passwordInput = $('password');
   const loginMessage = $('loginMessage'), selectMessage = $('selectMessage');
@@ -65,8 +66,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     activeView.classList.add('hidden');
     logsOverlay.classList.add('hidden');
     loginView.classList.remove('hidden');
-    emailInput.value = '';
     passwordInput.value = '';
+    // Prefill the remembered email — after a web-app password reset the user
+    // only needs to type their new password.
+    chrome.storage.local.get('lastLoginEmail').then(s => {
+      emailInput.value = s.lastLoginEmail || '';
+    });
     loginBtn.textContent = 'Login';
     loginBtn.disabled = false;
     showMessage(loginMessage, '', '');
@@ -105,7 +110,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     loginBtn.textContent = 'Authenticating...';
     loginBtn.disabled = true;
+    // Remember the email so the login view can prefill it (e.g. after a
+    // password reset completed on the web app).
+    chrome.storage.local.set({ lastLoginEmail: email });
     chrome.runtime.sendMessage({ type: 'HUB_LOGIN', payload: { email, password } });
+  });
+
+  // ── forgot password (bridges to the web app's email-link reset) ──
+  forgotLink.addEventListener('click', async () => {
+    await chrome.tabs.create({ url: 'https://app.dmdroid.app/auth' });
+    window.close();
   });
 
   // ── manual reconnect (edge state only) ──
