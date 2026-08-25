@@ -614,7 +614,7 @@ class Instagram {
                 username: a
               }) ? (await this.domConnector.send("openUser", {
                 username: a
-              }), this.log({
+              }, { timeoutMs: 240000 }), this.log({
                 type: "openUser finished",
                 data: {
                   username: a,
@@ -719,7 +719,7 @@ class Instagram {
                 this.log({ type: "[Followup] isOpenNewTab set — scraping LIVE thread id from search dialog", data: { username: e.username, taskId: s } });
                 h = await this.domConnector.send("findUserInDialogWithoutClick", {
                   username: e.username
-                });
+                }, { timeoutMs: 240000 });
                 var _liveThreadId = h?.candidate?.id ?? null;
                 this.log({ type: "[Followup] Live thread id scraped from search results", data: { username: e.username, taskId: s, threadId: _liveThreadId, matched: !!h?.candidate } });
                 if (_liveThreadId) {
@@ -743,7 +743,7 @@ class Instagram {
               }
               await this.domConnector.send("openUser", {
                 username: e.username
-              }), this.log({
+              }, { timeoutMs: 240000 }), this.log({
                 type: "User opened",
                 data: {}
               })
@@ -987,7 +987,7 @@ class Instagram {
             try {
               await this._openDirectIfNeeded();
               await this.sleep(5e3);
-              await this.domConnector.send("openUser", { username: e.username });
+              await this.domConnector.send("openUser", { username: e.username }, { timeoutMs: 240000 });
               await this.sleep(5e3);
             } catch (openErr) {
               this.log({ type: "[Followup] openUser failed", data: { error: openErr?.toString?.() } });
@@ -1823,11 +1823,11 @@ class Instagram {
           requiresNewTab: !0,
           threadId: (await this.domConnector.send("findUserInDialogWithoutClick", {
             username: t.username
-          })).candidate.id
+          }, { timeoutMs: 240000 })).candidate.id
         };
         await this.domConnector.send("openUser", {
           username: t.username
-        })
+        }, { timeoutMs: 240000 })
       }
       var r = (await this.domConnector.send("getAllMessages", {}))[t.username];
       var i, n = {
