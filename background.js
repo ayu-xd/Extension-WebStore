@@ -560,6 +560,9 @@ async function startEngine() {
   chrome.alarms.create("engine_poll", { periodInMinutes: 0.25 }); // 15 seconds
   chrome.alarms.create("engine_refresh_token", { periodInMinutes: 45 }); // Refresh JWT every 45 min
   chrome.alarms.create("engine_collect_messages", { periodInMinutes: 2 }); // Every 2 min read-receipt check
+  // UNIBOX: replies are user-initiated and bypass campaign pacing/sleeps,
+  // so they get their own alarm that runs even while the engine sleeps.
+  chrome.alarms.create("unibox_poll", { periodInMinutes: 1 });
 
   // Trigger initial runs
   pollTasks();
@@ -600,6 +603,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     }
   } else if (alarm.name === "engine_poll") {
     pollTasks().catch(() => { });
+  } else if (alarm.name === "unibox_poll") {
+    pollUniboxReplies().catch(() => { });
   } else if (alarm.name === "engine_refresh_token") {
     // Firm-hold login: the extension owns its own token family (independent
     // of the web app's). Refresh it unconditionally on schedule.
@@ -629,6 +634,152 @@ async function collectMessagesJob() {
     }).catch(() => null);
   } catch (err) {
     debugLog(`[Collector] Error triggering collectMessages: ${err.message}`);
+  }
+}
+
+// ── UNIBOX REPLIES (plan v2 §7 / Phase 4) ────────────────────────────────
+// User-initiated replies from the web dashboard. Deliberately BYPASS:
+//   - campaign pacing/sleeps (hot leads deserve fast answers)
+//   - working-hours clamps   (a human pressed Send)
+//   - the reply-exists guard (active back-and-forth chats: a newer inbound
+//     must never cancel a typed response — skipMessageExistsCheck=true)
+// Serialized one-at-a-time, ≥45s between automated sends (hot-lead pacing),
+// 7-day expiry for tasks stranded by an offline browser.
+let _uniboxInFlight = false;
+let _uniboxLastSendAt = 0;
+
+async function pollUniboxReplies() {
+  if (!state.browserId || !state.mainTabId) return;
+  if (_uniboxInFlight) return;
+  // hot-lead pacing: ≥45s between consecutive automated sends
+  if (Date.now() - _uniboxLastSendAt < 45000) return;
+
+  const nowIso = new Date().toISOString();
+
+  try {
+    // 0. Expire replies stranded by an offline browser (>7 days old)
+    const cutoff = new Date(Date.now() - 7 * 864e5).toISOString();
+    const stale = await supabaseReq(
+      `dm_tasks?select=id&task_type=eq.unibox_reply&browser_instance_id=eq.${state.browserId}&status=eq.pending&created_at=lt.${cutoff}`
+    );
+    if (stale?.length) {
+      const ids = stale.map(t => t.id).join(",");
+      await supabaseReq(`dm_tasks?id=in.(${ids})`, "PATCH", { status: "failed", error_reason: "expired_unsent" });
+      await supabaseReq(`ig_messages?dm_task_id=in.(${ids})&send_status=eq.queued`, "PATCH", { send_status: "failed", send_error: "Couldn't deliver — your browser was offline too long." });
+      debugLog(`[Unibox] expired ${stale.length} stale reply task(s).`);
+    }
+
+    // 1. Claim the oldest due reply (FIFO)
+    const due = await supabaseReq(
+      `dm_tasks?select=*&browser_instance_id=eq.${state.browserId}&task_type=eq.unibox_reply&status=eq.pending&or=(scheduled_at.is.null,scheduled_at.lte.${nowIso})&order=created_at.asc&limit=1`
+    );
+    if (!due || due.length === 0) return;
+    const rt = due[0];
+
+    _uniboxInFlight = true;
+    try {
+      await supabaseReq(`dm_tasks?id=eq.${rt.id}`, "PATCH", { status: "processing", claimed_at: nowIso });
+      await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}&send_status=eq.queued`, "PATCH", { send_status: "sending" });
+
+      // resolve lead handle from contact relation
+      let targetUsername = null;
+      if (rt.contact_id) {
+        const ct = await supabaseReq(`contacts?select=username&id=eq.${rt.contact_id}`);
+        targetUsername = ct?.[0]?.username || null;
+      }
+      if (!targetUsername) throw Object.assign(new Error("Lead handle missing for queued reply"), { permanent: true });
+      if (!rt.thread_id) throw Object.assign(new Error("No thread id on queued reply"), { permanent: true });
+
+      debugLog(`[Unibox] delivering reply to @${targetUsername} (task ${rt.id})`);
+
+      // Additional-tab delivery, ColdDMs-style: pre-navigate to the thread,
+      // then sendMessageFromDialog (self-recovery + composer contract).
+      const res = await sendTaskToContent(
+        "additional",
+        "sendMessageFromDialog",
+        {
+          target: { username: targetUsername },
+          message: { text: rt.message_text },
+          taskId: rt.id,
+          skipMessageExistsCheck: true
+        },
+        `https://www.instagram.com/direct/t/${rt.thread_id}/`
+      );
+
+      if (!res?.success) {
+        throw new Error(res?.error?.error || "content script reported failure");
+      }
+
+      // ── DELIVERED ── The composer contract confirmed the send inside the
+      // content script, so this task can NEVER be retried from here on.
+      // Everything below is best-effort bookkeeping: a cleanup failure is
+      // logged and swallowed — it must never re-fire a delivered DM.
+      _uniboxLastSendAt = Date.now();
+      try {
+        await supabaseReq(`dm_tasks?id=eq.${rt.id}`, "PATCH", { status: "completed", completed_at: new Date().toISOString() });
+      } catch (e) {
+        debugLog(`[Unibox] non-fatal: could not mark task completed: ${e.message}`);
+      }
+      // Swap the synthetic queued bubble for the real harvested row. If the
+      // DELETE fails, at least flip it to 'sent' so the UI never shows a
+      // stale Queued state for a message Instagram already has.
+      let deleted = false;
+      try {
+        await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}`, "DELETE");
+        deleted = true;
+      } catch (e) {
+        debugLog(`[Unibox] non-fatal: synthetic delete failed: ${e.message}`);
+      }
+      if (!deleted) {
+        try {
+          await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}`, "PATCH", { send_status: "sent" });
+        } catch (e) {
+          debugLog(`[Unibox] non-fatal: synthetic sent-flip failed: ${e.message}`);
+        }
+      }
+      debugLog(`[Unibox] reply delivered to @${targetUsername}.`);
+    } catch (err) {
+      const msg = String(err?.message || err);
+      const permanent =
+        err?.permanent ||
+        err?.errorType === "user_does_not_accept_dms" ||
+        /not found|does not allow|no thread id|handle missing/i.test(msg);
+      const attempts = Number(rt.retry_count || 0);
+      if (!permanent && attempts < 2) {
+        await supabaseReq(`dm_tasks?id=eq.${rt.id}`, "PATCH", {
+          status: "pending",
+          retry_count: attempts + 1,
+          error_reason: `[Unibox retry ${attempts + 1}/2] ${msg.slice(0, 150)}`
+        }).catch(e => debugLog(`[Unibox] requeue patch failed: ${e.message}`));
+        try {
+          await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}&send_status=eq.sending`, "PATCH", { send_status: "queued" });
+        } catch (_) { /* best-effort */ }
+        debugLog(`[Unibox] reply ${rt.id} transient failure, requeued: ${msg}`);
+      } else {
+        await supabaseReq(`dm_tasks?id=eq.${rt.id}`, "PATCH", {
+          status: "failed",
+          error_reason: msg.slice(0, 300)
+        }).catch(e => debugLog(`[Unibox] fail patch failed: ${e.message}`));
+        // best-effort bubble update; fall back to bare status if send_error
+        // column is missing (phase4 SQL not applied yet)
+        try {
+          await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}`, "PATCH", {
+            send_status: "failed",
+            send_error: permanent ? "Instagram won't let this account message this lead." : `Couldn't deliver after retries: ${msg.slice(0, 120)}`
+          });
+        } catch (_) {
+          try {
+            await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}`, "PATCH", { send_status: "failed" });
+          } catch (_e2) { /* leave as-is */ }
+        }
+        debugLog(`[Unibox] reply ${rt.id} permanently failed: ${msg}`);
+      }
+    } finally {
+      setTimeout(() => { _uniboxInFlight = false; }, 45000); // hot-lead gap
+    }
+  } catch (outer) {
+    debugLog(`[Unibox] poll error: ${outer.message}`);
+    _uniboxInFlight = false;
   }
 }
 
