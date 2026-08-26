@@ -342,6 +342,85 @@ class Instagram {
       }, 15000);
     });
   }
+  _normalizeInstagramTimestampMs(e) {
+    e = Number(e);
+    if (!Number.isFinite(e) || e <= 0) return null;
+    let t = Math.trunc(e);
+    for (; 1e13 < t;) t = Math.trunc(t / 1e3);
+    return t < 1e12 ? null : String(t)
+  }
+  async _emitUniboxCapture(targetUsername = null) {
+    // UNIBOX CAPTURE — HYBRID (plan v2 §5.4):
+    //  primary: full ReStore dump via getAllMessages (old-stack accounts)
+    //  fallback: live OffMsys DOM rows (new-stack accounts where MSYS tables
+    //  don't exist). Fallback requires a KNOWN target username, so it only
+    //  runs from post-send hooks — never blind, matching ColdDMs' design.
+    try {
+      const u = await this.domConnector.send("getUser", {});
+      let t = null;
+      try {
+        t = await this.domConnector.send("getAllMessages", {});
+      } catch (_storeErr) {
+        // New-stack accounts: ReStore lookups grind through dead modules and
+        // can exceed the connector timeout. A FAILED dump is treated exactly
+        // like an EMPTY dump — the DOM fallback below takes over.
+        this.log({ type: "[unibox] store dump unavailable", data: { error: String(_storeErr?.message || _storeErr) } });
+      }
+      let source = "restore";
+      if ((!t || !Object.keys(t).length) && targetUsername) {
+        const threadId = window.location.href.match(/direct\/t\/(\d+)/)?.[1];
+        const c = threadId ? await this.domConnector.send("collectThreadFromDOM", {}) : null;
+        let skipReason = !c ? "no_dom_result" : "unknown";
+        if (c && c.rowCount > 0 && Array.isArray(c.threadFbids) && c.threadFbids.length === 1
+            && Array.isArray(c.incomingSenderIds) && c.incomingSenderIds.length <= 1) {
+          const msgs = [];
+          for (const p of c.rows) {
+            if (typeof p.outgoing !== "boolean" || !p.message_id) continue;
+            const ts = this._normalizeInstagramTimestampMs(p.timestamp_ms);
+            if (!ts) continue;
+            msgs.push({
+              messageId: String(p.message_id),
+              text: typeof p.text === "string" ? p.text : null,
+              timestampMs: ts,
+              username: p.outgoing ? (u.username ?? null) : targetUsername,
+              sendStatusV2: "2"
+            });
+          }
+          if (msgs.length) {
+            msgs.sort((a, b) => Number(b.timestampMs) - Number(a.timestampMs));
+            t = {
+              [targetUsername]: {
+                username: targetUsername,
+                thread_key: String(threadId),
+                instagram_id: c.incomingSenderIds[0] != null ? String(c.incomingSenderIds[0]) : undefined,
+                contact_reachability_status_type: "0",
+                messages: msgs
+              }
+            };
+            source = "dom";
+          } else skipReason = "no_usable_messages";
+        } else if (c) {
+          skipReason = c.rowCount === 0 ? "no_rows"
+            : (c.threadFbids?.length > 1 ? "multiple_threads_rendered"
+            : (c.incomingSenderIds?.length > 1 ? "group_thread" : skipReason));
+        }
+        if (source !== "dom") {
+          this.log({ type: "[unibox] DOM capture skipped", data: { targetUsername, rowCount: c?.rowCount ?? 0, reason: skipReason } });
+        }
+      }
+      if (t && Object.keys(t).length && u?.id) {
+        await this.backgroundConnector.emit("saveConversations", {
+          threads: t,
+          instagram_account_id: u.id,
+          account_username: u.username ?? null,
+          source
+        });
+        this.log({ type: "[unibox] captured", data: { source, threads: Object.keys(t).length, targetUsername } });
+      }
+    } catch (err) {
+      this.log({ type: "[unibox] capture failed", data: { error: err?.toString?.() } });
+    }
+  }
   log({
     data: e,
     type: t
@@ -976,6 +1055,7 @@ class Instagram {
               }
 
               var w = window.location.href.match(/direct\/t\/(\d+)/)?.[1];
+              await this._emitUniboxCapture(e.username);
               return this.backgroundConnector.emit("successTask", {
                 result: !0,
                 taskId: s,
@@ -1178,6 +1258,7 @@ class Instagram {
                   text: g,
                   username: e.username
                 }), window.location.href.match(/direct\/t\/(\d+)/)?.[1]);
+              await this._emitUniboxCapture(e.username);
               return this.backgroundConnector.emit("successTask", {
                 result: !0,
                 taskId: s,
@@ -1223,6 +1304,8 @@ class Instagram {
             });
           }
           var t = await this.domConnector.send("getAllMessages", {});
+          // UNIBOX CAPTURE (periodic): same payload as post-send hooks.
+          await this._emitUniboxCapture();
           return t || {};
         } catch (e) {
           this.log({

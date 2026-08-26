@@ -632,6 +632,120 @@ async function collectMessagesJob() {
   }
 }
 
+// ── UNIBOX CAPTURE (plan v2 §5.2) ────────────────────────────────────────
+// IG sometimes returns microsecond timestamps; normalize to ms and reject
+// anything that can't be a real epoch-ms value.
+function normalizeIgTimestampMs(v) {
+  let n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  let t = Math.trunc(n);
+  while (t > 1e13) t = Math.trunc(t / 1000);
+  return t < 1e12 ? null : String(t);
+}
+
+// contacts lookup cache (60s) — one query per browser per minute, max
+let _uniboxContactsCache = { at: 0, userId: null, map: new Map() };
+
+async function uniboxResolveContext() {
+  if (!state.browserId) throw new Error("browser not paired");
+  const rows = await supabaseReq(
+    `browser_instances?select=id,user_id,ig_username&id=eq.${state.browserId}`
+  );
+  const row = rows && rows[0];
+  if (!row?.user_id) throw new Error("paired row missing user_id");
+  if (
+    _uniboxContactsCache.userId !== row.user_id ||
+    Date.now() - _uniboxContactsCache.at > 60000
+  ) {
+    const contacts = await supabaseReq(
+      `contacts?select=id,username&user_id=eq.${row.user_id}`
+    );
+    const map = new Map();
+    for (const c of contacts || []) {
+      map.set(String(c.username || "").toLowerCase(), c.id);
+    }
+    _uniboxContactsCache = { at: Date.now(), userId: row.user_id, map };
+  }
+  return {
+    userId: row.user_id,
+    accountUsername: row.ig_username
+      ? String(row.ig_username).toLowerCase().replace(/^@/, "")
+      : null,
+    contacts: _uniboxContactsCache.map
+  };
+}
+
+async function syncUniboxThreads(data) {
+  const ctx = await uniboxResolveContext();
+  const threads = data?.threads || {};
+  for (const [targetUsername, info] of Object.entries(threads)) {
+    try {
+      const handle = String(targetUsername || "").toLowerCase();
+      const contactId = ctx.contacts.get(handle) || null;
+      // campaign-lead filter: only threads belonging to known contacts
+      if (!contactId) continue;
+      if (!info?.thread_key || !Array.isArray(info.messages)) continue;
+
+      // group guard (v2 §5.4): >1 distinct non-account sender = group chat
+      const participantSenders = new Set(
+        info.messages.map(m => String(m.username || "").toLowerCase())
+      );
+      if (ctx.accountUsername) participantSenders.delete(ctx.accountUsername);
+      if (participantSenders.size > 1) continue;
+
+      // watermark: push only messages newer than last successful sync
+      const wmKey = `wm:${state.browserId}:${info.thread_key}`;
+      const wmData = await chrome.storage.local.get(wmKey);
+      const watermark = Number(wmData[wmKey] || 0);
+
+      const seenIds = new Set();
+      const fresh = [];
+      for (const m of info.messages) {
+        const ts = normalizeIgTimestampMs(m.timestampMs);
+        if (!ts) continue;
+        const id = String(m.messageId ?? "");
+        if (!id || seenIds.has(id)) continue;
+        seenIds.add(id);
+        if (Number(ts) <= watermark) continue;
+        fresh.push({
+          message_id: id,
+          is_own: String(m.username || "").toLowerCase() !== handle,
+          text: typeof m.text === "string" ? m.text : null,
+          sender_ig_id: m.instagram_id ? String(m.instagram_id) : null,
+          ts_ms: Number(ts)
+        });
+      }
+      if (!fresh.length) continue; // idle thread costs nothing
+
+      fresh.sort((a, b) => a.ts_ms - b.ts_ms);
+      const windowed = fresh.slice(-30); // rolling window cap
+
+      const payload = {
+        user_id: ctx.userId,
+        contact_id: contactId,
+        campaign_id: null,
+        browser_instance_id: state.browserId,
+        account_ig_username: ctx.accountUsername,
+        thread_id: String(info.thread_key),
+        target_username: targetUsername,
+        target_full_name: null,
+        target_profile_pic_url: null,
+        messages: windowed
+      };
+      const res = await supabaseReq(`rpc/sync_unibox_thread`, "POST", {
+        p_payload: payload
+      });
+      const out = Array.isArray(res) ? res[0] : res;
+      const newWm = Number(out?.watermark_ms || 0);
+      if (newWm > 0) await chrome.storage.local.set({ [wmKey]: newWm });
+      debugLog(`[Unibox] synced @${targetUsername}: ${windowed.length} msg(s), wm=${newWm}`);
+    } catch (e) {
+      // one bad thread must never abort the rest of the dump
+      debugLog(`[Unibox] thread ${targetUsername} failed: ${e.message}`);
+    }
+  }
+}
+
 async function processCollectedMessages(readReceipts) {
   try {
     if (!Array.isArray(readReceipts) || readReceipts.length === 0) return;
@@ -2033,6 +2147,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           await processCollectedMessages(taskData?.readReceipts || []);
           sendResponse({ success: true, result: true });
         } catch (err) {
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+    }
+
+    // saveConversations: UNIBOX CAPTURE (plan v2 §5) — content pushes the
+    // full ReStore thread dump; we filter to campaign leads, apply watermarks,
+    // and write via the sync_unibox_thread RPC (one round-trip per thread).
+    if (taskType === "saveConversations") {
+      (async () => {
+        try {
+          await syncUniboxThreads(taskData);
+          sendResponse({ success: true, result: true });
+        } catch (err) {
+          debugLog(`[Unibox] saveConversations failed: ${err.message}`);
           sendResponse({ success: false, error: err.message });
         }
       })();

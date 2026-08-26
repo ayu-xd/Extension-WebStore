@@ -902,7 +902,11 @@
           this.innerDomConnector.registerTask("alternativeSearchResultsMapping", ({ username: e }) =>
             this._alternativeSearchResultsMapping({ username: e }),
           ),
-          this.innerDomConnector.registerTask("detectInstagramError", () => this._detectInstagramError()));
+          this.innerDomConnector.registerTask("detectInstagramError", () => this._detectInstagramError()),
+          // UNIBOX CAPTURE: new-stack (OffMsys) thread rows for accounts where
+          // the MSYS ReStore tables no longer exist.
+          this.innerDomConnector.registerTask("collectThreadFromDOM", () =>
+            this._collectThreadFromDOM()));
       }
       constructor(e) {
         ((this._tree = e), (this.innerDomConnector = new t()), this.registerTasks(), setTimeout(() => {}, 5e3));
@@ -1827,6 +1831,27 @@
         return this._getAllMessagesFromDOM().some(
           (e) => !0 === e.outgoing && e.text && e.timestamp_ms && Number(e.timestamp_ms) >= Number(t),
         );
+      }
+      // UNIBOX CAPTURE (ported from ColdDMs 26-Aug): aggregate live OffMsys
+      // rows into the shape the content-side harvester expects. Guards
+      // (single thread, non-group) are applied by the caller.
+      _collectThreadFromDOM() {
+        const empty = { rows: [], rowCount: 0, threadFbids: [], incomingSenderIds: [], outgoingSenderIds: [] };
+        try {
+          const rows = this._getAllMessagesFromDOM();
+          if (!Array.isArray(rows)) return empty;
+          const uniq = (arr) => [...new Set(arr.filter((v) => v != null).map(String))];
+          return {
+            rows,
+            rowCount: rows.length,
+            threadFbids: uniq(rows.map((r) => r.thread_fbid)),
+            incomingSenderIds: uniq(rows.filter((r) => r.outgoing === false).map((r) => r.sender_user_id)),
+            outgoingSenderIds: uniq(rows.filter((r) => r.outgoing === true).map((r) => r.sender_user_id)),
+          };
+        } catch (e) {
+          console.warn("[ColdDMs] _collectThreadFromDOM error", e);
+          return empty;
+        }
       }
       async _getDebugMessages() {
         try {

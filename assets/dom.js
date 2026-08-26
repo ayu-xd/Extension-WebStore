@@ -212,7 +212,7 @@ class ADBlockDOM {
       dateBeforeSend: e
     }) => this._checkOutgoingMessageSentFromDOM({
       dateBeforeSend: e
-    })), this.domConnector.registerTask("navigateToInbox", () => this._navigateToInbox()), this.domReactConnector.registerTask("sleep", ({
+    })), this.domConnector.registerTask("navigateToInbox", () => this._navigateToInbox()), this.domConnector.registerTask("collectThreadFromDOM", (e = {}) => this._collectThreadFromDOM(e)), this.domReactConnector.registerTask("sleep", ({
       time: e
     }) => this.sleep(e)), this.domReactConnector.registerTask("log", ({
       data: e,
@@ -221,6 +221,10 @@ class ADBlockDOM {
       data: e,
       type: t
     }))
+  }
+  // UNIBOX CAPTURE bridge — forwards to the React layer's OffMsys row reader.
+  async _collectThreadFromDOM(e = {}) {
+    return this.domReactConnector.send("collectThreadFromDOM", e)
   }
   log({
     data: e,
