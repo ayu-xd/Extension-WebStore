@@ -1167,7 +1167,9 @@ async function pollTasks() {
           if (retryClass === "rate_limited_error") {
             debugLog("[Pacing] Rate limit error detected! Pausing engine to prevent ban.");
             await chrome.storage.local.set({ enginePaused: true });
-          } else if (err.unreachableType && task.contact_id) {
+          } else if ((err.unreachableType || retryClass === "user_not_found") && task.contact_id) {
+            // user_not_found included (F11): a 404'd handle is dead forever —
+            // park the contact so future campaigns never claim it again.
             await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
               status: "unreachable"
             });

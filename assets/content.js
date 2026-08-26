@@ -695,6 +695,27 @@ class Instagram {
               target: e,
               message: t
             })) {
+            // F11: pre-flight existence check — one cheap web_profile_info call
+            // (same endpoint ColdDMs uses) before any expensive dialog work.
+            // 404 -> typed user_not_found -> retry engine treats it as terminal.
+            // Other failures (rate_limited/auth/network) are non-terminal: log
+            // and continue with the legacy flow. Skipped when the payload
+            // already carries a targetUserId or useProfile will fetch it anyway.
+            var _preflightUser = null;
+            if (!r && !_targetUserId) {
+              try {
+                _preflightUser = await this.domConnector.send("getUserByUsername", { username: e.username });
+                this.log({ type: "[sendMessage] Pre-flight: lead exists", data: { username: e.username, userId: _preflightUser?.id ?? null } });
+              } catch (_pfErr) {
+                if (_pfErr?.type === "user_not_found") {
+                  throw new ExtensionError({
+                    type: "user_not_found",
+                    message: "Lead handle does not exist on Instagram — skipping all dialog work"
+                  });
+                }
+                this.log({ type: "[sendMessage] Pre-flight lookup failed (non-terminal, continuing)", data: { username: e.username, error: _pfErr?.toString?.() } });
+              }
+            }
             if (r) l = await this.domConnector.send("getUserByUsername", {
               username: e.username
             }), this.log({
@@ -754,11 +775,17 @@ class Instagram {
                   type: "[sendMessage] Dialog open failed — falling back to profile route",
                   data: { username: e.username, error: String(_dialogErr?.message || _dialogErr) }
                 });
-                let _profUser = null;
-                try {
-                  _profUser = await this.domConnector.send("getUserByUsername", { username: e.username });
-                } catch (_idErr) {
-                  throw _dialogErr;
+                // Reuse the F11 pre-flight result — no second API call.
+                let _profUser = _preflightUser;
+                if (!_profUser?.id) {
+                  try {
+                    _profUser = await this.domConnector.send("getUserByUsername", { username: e.username });
+                  } catch (_idErr) {
+                    if (_idErr?.type === "user_not_found") {
+                      throw new ExtensionError({ type: "user_not_found", message: "Lead handle does not exist on Instagram" });
+                    }
+                    throw _dialogErr;
+                  }
                 }
                 if (!_profUser?.id) throw _dialogErr;
                 try {
@@ -1015,7 +1042,25 @@ class Instagram {
           throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
         }
         try {
-          if (this.isBusy = !0, this.taskId = s, this._checkIfUserReceivedBlockMessage(), await this.domConnector.send("preTaskHooks", {}), await this.sleep(5e3), await this._checkIfOpenUserRequired({
+          // Set the busy lock FIRST (before any await) so no second task can
+          // slip in while the pre-flight call below is in flight. The finally
+          // block resets it if we throw.
+          this.isBusy = !0, this.taskId = s, this._checkIfUserReceivedBlockMessage();
+          // F11: pre-flight existence check (same as main tab). Ghost leads
+          // must die here in one call, not after minutes of dialog polling.
+          var _pfUser = null;
+          try {
+            _pfUser = await this.domConnector.send("getUserByUsername", { username: e.username });
+          } catch (_pfErr) {
+            if (_pfErr?.type === "user_not_found") {
+              throw new ExtensionError({
+                type: "user_not_found",
+                message: "Lead handle does not exist on Instagram — skipping all dialog work"
+              });
+            }
+            this.log({ type: "[sendMessageFromDialog] Pre-flight lookup failed (non-terminal, continuing)", data: { username: e.username, error: _pfErr?.toString?.() } });
+          }
+          if (await this.domConnector.send("preTaskHooks", {}), await this.sleep(5e3), await this._checkIfOpenUserRequired({
               username: e.username
             })) {
             // Self-recover: instead of erroring, open the thread live by username
