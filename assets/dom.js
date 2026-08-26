@@ -396,13 +396,6 @@ class ADBlockDOM {
         }) => String(e.igid) === String(n.resultIgid)));
         if (e) this.log({ type: "[searchWindow] Matched via server_search_results fallback", data: { username: s, threadId: e?.candidate?.id ?? null } });
       }
-      if (!e) {
-        const singleMatch = r.filter(x => "user" === x.type);
-        if (singleMatch.length === 1) {
-          e = singleMatch[0];
-          this.log({ type: "[searchWindow] Matched via single-result heuristic", data: { username: s, threadId: e?.candidate?.id ?? null } });
-        }
-      }
       if (!e) this.log({ type: "[searchWindow] No match found in this pass", data: { username: s } });
       return e
     }

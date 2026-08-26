@@ -741,12 +741,44 @@ class Instagram {
                 // path below instead of handing off a blank id.
                 this.log({ type: "[Followup] No live thread id — falling back to main-tab send", data: { username: e.username, taskId: s } });
               }
-              await this.domConnector.send("openUser", {
-                username: e.username
-              }, { timeoutMs: 240000 }), this.log({
-                type: "User opened",
-                data: {}
-              })
+              // F7: dialog search is the flaky step (fiber typing can silently
+              // no-op -> 20 suggestion rows -> "No fiber match" -> timeout).
+              // On failure, fall back to ColdDMs' profile route: top-bar search
+              // matched by numeric ID + Message button + verified inbox arrival.
+              try {
+                await this.domConnector.send("openUser", {
+                  username: e.username
+                }, { timeoutMs: 240000 });
+              } catch (_dialogErr) {
+                this.log({
+                  type: "[sendMessage] Dialog open failed — falling back to profile route",
+                  data: { username: e.username, error: String(_dialogErr?.message || _dialogErr) }
+                });
+                let _profUser = null;
+                try {
+                  _profUser = await this.domConnector.send("getUserByUsername", { username: e.username });
+                } catch (_idErr) {
+                  throw _dialogErr;
+                }
+                if (!_profUser?.id) throw _dialogErr;
+                try {
+                  await this.domConnector.send("openChatFromProfile", {
+                    username: e.username,
+                    id: _profUser.id
+                  });
+                  this.log({ type: "[sendMessage] User opened via profile route", data: { username: e.username, userId: _profUser.id } });
+                } catch (_profErr) {
+                  const _msg = String(_profErr?.message || "");
+                  if (_msg.includes("do not allow")) {
+                    throw new ExtensionError({
+                      type: "user_does_not_accept_dms",
+                      message: "Lead does not allow new messages (no Message button on profile)"
+                    });
+                  }
+                  throw _dialogErr;
+                }
+              }
+              this.log({ type: "User opened", data: {} });
             } else this.log({
               type: "User is already opened",
               data: {}
@@ -781,11 +813,18 @@ class Instagram {
               // already replied. checkResponseByReactAPI now falls back to the live DOM
               // rows when the store is empty, so the check must always run here.
               if (!o && !SETTINGS.IGNORE_MESSAGE_EXISTS) {
-                var m = await this.checkResponseByReactAPI(e);
+                // F9: pass the task's time anchor through when the background
+                // supplies one (inert until replyCheckSince exists in payload).
+                var m = await this.checkResponseByReactAPI({ username: e.username, sinceMs: e.replyCheckSince ?? null });
                 if (Boolean(m)) {
                   this.log({
                     type: "Message from user exists, skipping send message",
-                    data: {}
+                    data: {
+                      username: e.username,
+                      sinceMs: e.replyCheckSince ?? null,
+                      replyTimestampMs: String(m.timestampMs ?? ""),
+                      text: String(m.text ?? "").substring(0, 60)
+                    }
                   });
                   var k = window.location.href.match(/direct\/t\/(\d+)/)?.[1] ?? g?.thread_key;
                   return this.backgroundConnector.emit("successTask", {
@@ -990,7 +1029,27 @@ class Instagram {
               await this.domConnector.send("openUser", { username: e.username }, { timeoutMs: 240000 });
               await this.sleep(5e3);
             } catch (openErr) {
-              this.log({ type: "[Followup] openUser failed", data: { error: openErr?.toString?.() } });
+              this.log({ type: "[Followup] openUser failed — trying profile route", data: { username: e.username, error: openErr?.toString?.() } });
+              // F7: same fallback as main tab — ID-matched profile route when
+              // the dialog search silently fails. If it also fails, fall
+              // through to the existing hard-failure check below.
+              try {
+                const _profUser = await this.domConnector.send("getUserByUsername", { username: e.username });
+                if (_profUser?.id) {
+                  await this.domConnector.send("openChatFromProfile", { username: e.username, id: _profUser.id });
+                  this.log({ type: "[Followup] Thread opened via profile route", data: { username: e.username, userId: _profUser.id } });
+                  await this.sleep(5e3);
+                }
+              } catch (profErr) {
+                const _msg = String(profErr?.message || "");
+                if (_msg.includes("do not allow")) {
+                  throw new ExtensionError({
+                    type: "user_does_not_accept_dms",
+                    message: "Lead does not allow new messages (no Message button on profile)"
+                  });
+                }
+                this.log({ type: "[Followup] Profile route also failed", data: { error: profErr?.toString?.() } });
+              }
             }
             if (await this._checkIfOpenUserRequired({ username: e.username })) {
               // Hard failure after self-recovery attempt. THROW (not emit+return):
@@ -1033,10 +1092,16 @@ class Instagram {
               // tab: dropped the `o?.messages?.length` precondition so the reply check
               // runs even when the ReStore hasn't hydrated the thread yet on this tab.
               if (!r && !SETTINGS.IGNORE_MESSAGE_EXISTS) {
-                var d, h = await this.checkResponseByReactAPI(e);
+                var d, h = await this.checkResponseByReactAPI({ username: e.username, sinceMs: e.replyCheckSince ?? null });
                 if (Boolean(h)) return this.log({
                   type: "Message from user exists, skipping send message",
-                  data: {}
+                  data: {
+                    username: e.username,
+                    sinceMs: e.replyCheckSince ?? null,
+                    replyTimestampMs: String(h.timestampMs ?? ""),
+                    text: String(h.text ?? "").substring(0, 60),
+                    additionalTab: !0
+                  }
                 }), d = window.location.href.match(/direct\/t\/(\d+)/)?.[1] ?? o?.thread_key, this.backgroundConnector.emit("successTask", {
                   result: !0,
                   taskId: s,
@@ -1207,15 +1272,49 @@ class Instagram {
     // No thread in the ReStore (common on a freshly-opened tab that hasn't
     // hydrated yet) → fall back to reading the live message rows from the DOM.
     // Propagate sinceMs so the fallback can ignore anything older than it.
-    if (!e) return this.domConnector.send("checkResponseFromDOM", { sinceMs: _sinceMs });
+    if (!e) {
+      this.log({ type: "[replyGuard] Store empty — reading live DOM rows instead", data: { username: t, sinceMs: _sinceMs } });
+      const _domHit = await this.domConnector.send("checkResponseFromDOM", { sinceMs: _sinceMs });
+      this.log({
+        type: _domHit ? "[replyGuard] DOM fallback detected a reply" : "[replyGuard] DOM fallback: no reply newer than anchor",
+        data: { username: t, sinceMs: _sinceMs, text: String(_domHit?.text ?? "").substring(0, 60) || null }
+      });
+      return _domHit;
+    }
     // ReStore has the thread: an inbound message is one whose `username` equals
     // the target (outbound carries our own account username). When sinceMs is
     // supplied, only count replies newer than it so a stale inbound message
     // from before our last send can't be mistaken for a fresh reply.
     var _candidates = e.messages.filter(e => e.username === t);
-    if (_sinceMs != null) _candidates = _candidates.filter(e => Number(e.timestampMs) > Number(_sinceMs));
+    if (_sinceMs != null) {
+      const _staleCount = _candidates.length - _candidates.filter(e => Number(e.timestampMs) > Number(_sinceMs)).length;
+      if (_staleCount > 0) this.log({
+        type: "[replyGuard] Suppressed stale replies (older than last send)",
+        data: { username: t, staleCount: _staleCount, sinceMs: _sinceMs }
+      });
+      _candidates = _candidates.filter(e => Number(e.timestampMs) > Number(_sinceMs));
+    } else if (_candidates.length) {
+      // F9 visibility: unanchored check — a reply from ANY point in history
+      // will count as fresh. This is the silent skip driver.
+      this.log({
+        type: "[replyGuard] WARNING no time anchor — historical replies count as fresh",
+        data: { username: t, oldestInboundTimestampMs: String(_candidates[_candidates.length - 1]?.timestampMs ?? "") }
+      });
+    }
     // messages are pre-sorted newest-first, so [0] is the most recent reply.
-    return _candidates[0] || null;
+    const _hit = _candidates[0] || null;
+    if (_hit) this.log({
+      type: "[replyGuard] Reply detected (store)",
+      data: {
+        username: t,
+        threadKey: e.thread_key ?? null,
+        sinceMs: _sinceMs,
+        replyTimestampMs: String(_hit.timestampMs ?? ""),
+        agePastAnchorMs: _sinceMs != null && _hit.timestampMs ? Number(_hit.timestampMs) - Number(_sinceMs) : null,
+        text: String(_hit.text ?? "").substring(0, 60)
+      }
+    });
+    return _hit;
   }
   async openDirect(e) {
     await this._findSearchButton(), await this.sleep(2e3), await this.domConnector.send("inputSearch", {
@@ -1668,9 +1767,13 @@ class Instagram {
     const expected = norm(t);
     let typed = "";
     for (let attempt = 0; attempt < 3; attempt++) {
+      // F10: no timeout on typing — per-char timers get throttled to ~1s in
+      // background tabs, so a 45s guillotine cut long messages mid-flight and
+      // the retry replayed them from scratch (matches ColdDMs: no timeout here).
+      // Failures are caught downstream by the composer-empty verification.
       await this.domConnector.send("enterMessage", {
         text: t
-      }, { timeoutMs: 45000 });
+      }, { timeoutMs: 0 });
       await this.sleep(Helpers.rand(50, 150));
       typed = await this.domConnector.send("getMessageInput", {});
       if (norm(typed) === expected) break;
