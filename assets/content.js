@@ -761,8 +761,21 @@ class Instagram {
 
         var d, l, h;
         if (this.isBusy) {
-          this.log({ type: "Got send message task but thread is busy", data: {} });
-          throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
+          // ── RELIABILITY FIX (root cause of double-text) ──────────────────────────────
+          // Never throw on isBusy. Throwing causes BackgroundConnector.processMessage to
+          // return {success:false}, which immediately rejects the background's executeTask
+          // Promise, releases state.isProcessing, and 15 s later re-claims this same task
+          // into a still-busy tab — all while this content script is still mid-send.
+          // That concurrent execution is what delivers the "3 bubbles sent again and again".
+          //
+          // Returning silently keeps {success:true} flowing back so:
+          //   • The background's Promise stays alive, waiting on successTask/errorTask.
+          //   • state.isProcessing stays locked — no new polls can fire.
+          //   • The currently-running task emits its own successTask/errorTask, which
+          //     the waiting Promise hears and resolves cleanly. One send. Done.
+          // ─────────────────────────────────────────────────────────────────────────────
+          this.log({ type: "[sendMessage] Thread busy — returning silently; background holds its Promise", data: { currentTaskId: this.taskId, incomingTaskId: s } });
+          return;
         }
         try {
           this.log({ type: "[sendMessage] Entering try block, setting isBusy = true", data: {} });
@@ -1118,8 +1131,11 @@ class Instagram {
 
         var i;
         if (this.isBusy) {
-          this.log({ type: "Got send message task but thread is busy", data: {} });
-          throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
+          // Silent return — same rationale as sendMessage. Never throw on isBusy.
+          // The background keeps its Promise alive; the active task finishes and
+          // emits successTask/errorTask which resolves the waiting Promise cleanly.
+          this.log({ type: "[sendMessageFromDialog] Thread busy — returning silently", data: { currentTaskId: this.taskId, incomingTaskId: s } });
+          return;
         }
         try {
           // Set the busy lock FIRST (before any await) so no second task can
@@ -1324,8 +1340,9 @@ class Instagram {
         taskId: r
       }) => {
         if (this.isBusy) {
-          this.log({ type: "Got send inbox message task but thread is busy", data: {} });
-          throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
+          // Silent return — same rationale as sendMessage. Never throw on isBusy.
+          this.log({ type: "[sendInboxMessage] Thread busy — returning silently", data: { currentTaskId: this.taskId, incomingTaskId: r } });
+          return;
         }
         try {
           this.isBusy = !0, this.taskId = r, this._checkIfUserReceivedBlockMessage(), await this._openDirectIfNeeded(), await this.sleep(5e3);

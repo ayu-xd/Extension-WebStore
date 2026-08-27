@@ -1216,7 +1216,7 @@ async function pollTasks() {
   }
 
   if (state.isProcessing) {
-    if (Date.now() - state.processingLockAcquiredAt > 600000) {
+    if (Date.now() - state.processingLockAcquiredAt > 960000) { // 16 min: just above the 15-min task timeout
       debugLog(`[System] Auto-recovering locked engine.`);
       state.isProcessing = false;
     } else {
@@ -1394,8 +1394,13 @@ async function pollTasks() {
       }, "error");
       if (isThreadBusy) {
         await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "pending" });
-        debugLog(`[Recovery] Task ${task.task_type} re-queued as pending (thread was busy)`);
+        debugLog(`[Recovery] Task ${task.task_type} re-queued as pending (thread was busy) — backing off 60 s`);
         dlog("task_requeued_busy", { taskId: task.id }, "warn");
+        // Back off 60 s before next poll. Without this the 15 s alarm immediately
+        // re-claims the same task into a still-busy tab, producing the thread_busy
+        // hammer loop. This is a safety net for any edge-case where thread_busy still
+        // surfaces; the primary fix is the silent-return in content.js isBusy guards.
+        await setWake('busy_backoff', Date.now() + 60_000);
       } else {
         const isPermanentError = [
           "user_is_unreachable",
@@ -1661,6 +1666,11 @@ async function executeTask(task) {
         if (!resolved) {
           resolved = true;
           chrome.runtime.onMessage.removeListener(handler);
+          // 5-min timeout is correct: clean task runs complete in 2-4 min (confirmed by
+          // production logs: manickbhan=145s, will_whats_next=217s). The old 46-77 min
+          // bloat was caused by the thread_busy loop — now fixed by isBusy silent return.
+          // If content genuinely dies (SW restart, tab close), we want to recover in 5 min,
+          // not 15. Keeping this tight is the right call for dead-task recovery speed.
           dlog("task_timeout", { taskId: task.id, taskType: task.task_type, waitedMs: 300000 }, "warn");
           reject(new Error("Task timed out waiting for content script response"));
         }
@@ -1813,6 +1823,7 @@ async function executeTask(task) {
         if (!resolved) {
           resolved = true;
           chrome.runtime.onMessage.removeListener(handler);
+          // 5-min timeout — same rationale as first_dm above. Correct for dead-task recovery.
           dlog("task_timeout", { taskId: task.id, taskType: task.task_type, waitedMs: 300000 }, "warn");
           reject(new Error("Followup task timed out waiting for content script response"));
         }
@@ -2245,9 +2256,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    // successTask / errorTask: scraping results
+    // successTask / errorTask: handled primarily by the Promise listener in executeTask.
+    // ORPHANED SUCCESS ABSORPTION: if the Promise listener was already removed (task
+    // timed out and was retried) when the content script finally emits successTask, this
+    // global handler catches it and marks the DB row completed. That prevents the retry
+    // from re-executing and re-sending the same message — the direct cause of double-text
+    // on the "content finishes after background timeout" path (confirmed in production logs).
     if (taskType === "successTask" || taskType === "errorTask") {
-      // already handled by the Promise listener in executeTask
+      if (taskType === "successTask" && taskData?.taskId) {
+        // Best-effort PATCH: only updates rows still in 'processing' status, so it is
+        // a no-op on rows the Promise handler already completed. Idempotent and safe.
+        supabaseReq(
+          `dm_tasks?id=eq.${taskData.taskId}&status=eq.processing`,
+          "PATCH",
+          { status: "completed", completed_at: new Date().toISOString() }
+        ).catch(() => {}); // fire-and-forget — never block the message handler
+      }
       sendResponse({ success: true });
       return;
     }
