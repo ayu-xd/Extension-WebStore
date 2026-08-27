@@ -217,6 +217,54 @@ async function caoUpsert(contactId, fields) {
   }
 }
 
+// A send can finish after executeTask's listener timed out. In that case the
+// normal pollTasks success path never runs, so settle both the task and the
+// contact here. This is deliberately limited to the fail-closed
+// `delivery_unknown` state created by the timeout handler above.
+async function settleLateVerifiedDelivery(taskId) {
+  const completedAt = new Date().toISOString();
+  const rows = await supabaseReq(
+    `dm_tasks?id=eq.${taskId}&status=eq.failed&error_reason=like.delivery_unknown*`,
+    "PATCH",
+    { status: "completed", completed_at: completedAt, error_reason: null }
+  );
+  const task = rows?.[0];
+  if (!task) return false;
+
+  if (task.contact_id && task.task_type === "first_dm") {
+    await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+      status: "dmed",
+      dmed_at: completedAt,
+      assigned_browser_id: state.browserId
+    });
+    await caoUpsert(task.contact_id, {
+      status: "dmed",
+      dmed_at: completedAt,
+      campaign_id: task.campaign_id || null
+    });
+  } else if (task.contact_id && task.task_type?.startsWith("followup_")) {
+    const stepLetter = task.task_type.replace("followup_1", "").toUpperCase() || "A";
+    await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+      followup_1a_sent: true,
+      current_follow_up: `1${stepLetter}`,
+      last_follow_up_at: completedAt
+    });
+    await caoUpsert(task.contact_id, {
+      followup_1a_sent: true,
+      current_follow_up: `1${stepLetter}`,
+      last_follow_up_at: completedAt
+    });
+  }
+
+  state.stats.failed = Math.max(0, state.stats.failed - 1);
+  state.stats.completed++;
+  state.lastTaskCompletedAt = Date.now();
+  await chrome.storage.local.set({ stats: state.stats });
+  dlog("late_delivery_completed", { taskId, taskType: task.task_type });
+  debugLog(`[Safety] Late verified delivery completed for task ${taskId}.`);
+  return true;
+}
+
 async function refreshAccessToken() {
   try {
     const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
@@ -539,17 +587,10 @@ async function startEngine() {
   console.log(`Starting Engine with Browser ID: ${state.browserId}`);
   debugLog(`Engine started for ${state.browserLabel}`);
 
-  // Reset any tasks stuck in "processing" back to "pending" (crash recovery)
-  if (state.browserId) {
-    try {
-      const stale = await supabaseReq(`dm_tasks?browser_instance_id=eq.${state.browserId}&status=eq.processing`, "PATCH", { status: "pending" });
-      if (stale && stale.length > 0) {
-        debugLog(`[Recovery] Reset ${stale.length} stuck processing task(s) back to pending`);
-      }
-    } catch (err) {
-      debugLog(`[Recovery] Failed to reset stale tasks: ${err.message}`);
-    }
-  }
+  // Never turn every in-flight send back into pending on startup. A previous
+  // service worker can still have clicked Instagram's Send button when this
+  // worker starts; requeueing it here creates a second physical DM. Tasks that
+  // cannot report a final outcome are left for explicit reconciliation instead.
 
   // Create alarms for the Manifest V3 background script.
   // Heartbeat must ALWAYS be scheduled whenever a browser is active — the auto-pair
@@ -1383,6 +1424,13 @@ async function pollTasks() {
       // ONLY on the genuine unreachableType.
       const retryClass = err.unreachableType || err.errorType || null;
       const isThreadBusy = err.errorType === "thread_busy" || err.message?.includes("thread is busy");
+      // A content-script timeout happens after the task was dispatched, so the
+      // message may already be in Instagram. The same is true when Send was
+      // clicked but our post-send verifier cannot see the new bubble. Neither
+      // condition is retry-safe: resending is exactly how duplicate DMs occur.
+      const isDeliveryUnknown =
+        retryClass === "send_unconfirmed_error" ||
+        /timed out waiting for content script response/i.test(String(err.message || ""));
       dlog("task_failed", {
         taskId: task.id,
         taskType: task.task_type,
@@ -1392,7 +1440,15 @@ async function pollTasks() {
         retryClass,
         message: String(err.message || err).slice(0, 300)
       }, "error");
-      if (isThreadBusy) {
+      if (isDeliveryUnknown) {
+        await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
+          status: "failed",
+          error_reason: `delivery_unknown: ${String(err.message || err).slice(0, 240)}`
+        });
+        state.stats.failed++;
+        debugLog(`[Safety] Task ${task.id} reached an unknown delivery state; it will not be auto-retried.`);
+        dlog("task_delivery_unknown", { taskId: task.id, taskType: task.task_type, retryClass }, "warn");
+      } else if (isThreadBusy) {
         await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "pending" });
         debugLog(`[Recovery] Task ${task.task_type} re-queued as pending (thread was busy) — backing off 60 s`);
         dlog("task_requeued_busy", { taskId: task.id }, "warn");
@@ -1666,15 +1722,14 @@ async function executeTask(task) {
         if (!resolved) {
           resolved = true;
           chrome.runtime.onMessage.removeListener(handler);
-          // 5-min timeout is correct: clean task runs complete in 2-4 min (confirmed by
-          // production logs: manickbhan=145s, will_whats_next=217s). The old 46-77 min
-          // bloat was caused by the thread_busy loop — now fixed by isBusy silent return.
-          // If content genuinely dies (SW restart, tab close), we want to recover in 5 min,
-          // not 15. Keeping this tight is the right call for dead-task recovery speed.
-          dlog("task_timeout", { taskId: task.id, taskType: task.task_type, waitedMs: 300000 }, "warn");
+          // A browser-throttled, multi-bubble DM took just over six minutes in production.
+          // Ten minutes leaves room for that without making a genuinely dead task wait for
+          // the old 15-minute window. Timeout outcomes are settled as delivery_unknown,
+          // never retried as a new physical send.
+          dlog("task_timeout", { taskId: task.id, taskType: task.task_type, waitedMs: 600000 }, "warn");
           reject(new Error("Task timed out waiting for content script response"));
         }
-      }, 300000);
+      }, 600000);
 
       chrome.runtime.onMessage.addListener(handler);
 
@@ -1823,11 +1878,13 @@ async function executeTask(task) {
         if (!resolved) {
           resolved = true;
           chrome.runtime.onMessage.removeListener(handler);
-          // 5-min timeout — same rationale as first_dm above. Correct for dead-task recovery.
-          dlog("task_timeout", { taskId: task.id, taskType: task.task_type, waitedMs: 300000 }, "warn");
+          // Match the first-DM ten-minute watchdog: background-tab throttling can make
+          // a legitimate multi-step delivery exceed five minutes. This path also settles
+          // an expired delivery as unknown instead of retrying the physical send.
+          dlog("task_timeout", { taskId: task.id, taskType: task.task_type, waitedMs: 600000 }, "warn");
           reject(new Error("Followup task timed out waiting for content script response"));
         }
-      }, 300000);
+      }, 600000);
 
       chrome.runtime.onMessage.addListener(handler);
 
@@ -2257,20 +2314,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     // successTask / errorTask: handled primarily by the Promise listener in executeTask.
-    // ORPHANED SUCCESS ABSORPTION: if the Promise listener was already removed (task
-    // timed out and was retried) when the content script finally emits successTask, this
-    // global handler catches it and marks the DB row completed. That prevents the retry
-    // from re-executing and re-sending the same message — the direct cause of double-text
-    // on the "content finishes after background timeout" path (confirmed in production logs).
+    // If the listener timed out but the content script later verifies the Instagram
+    // message, complete only rows which are still processing or were explicitly marked
+    // delivery_unknown. We intentionally never revive arbitrary failed rows.
     if (taskType === "successTask" || taskType === "errorTask") {
       if (taskType === "successTask" && taskData?.taskId) {
-        // Best-effort PATCH: only updates rows still in 'processing' status, so it is
-        // a no-op on rows the Promise handler already completed. Idempotent and safe.
-        supabaseReq(
-          `dm_tasks?id=eq.${taskData.taskId}&status=eq.processing`,
-          "PATCH",
-          { status: "completed", completed_at: new Date().toISOString() }
-        ).catch(() => {}); // fire-and-forget — never block the message handler
+        const completion = { status: "completed", completed_at: new Date().toISOString(), error_reason: null };
+        // Normal completion path (including the Promise listener race).
+        supabaseReq(`dm_tasks?id=eq.${taskData.taskId}&status=eq.processing`, "PATCH", completion).catch(() => {});
+        // Late success after a timeout: only absorb the narrow fail-closed state
+        // created above, never a real permanent failure. This also performs the
+        // normal contact/follow-up completion bookkeeping the timed-out poller
+        // could no longer reach.
+        settleLateVerifiedDelivery(taskData.taskId).catch(() => {});
       }
       sendResponse({ success: true });
       return;

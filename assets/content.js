@@ -1789,7 +1789,7 @@ class Instagram {
     }
     throw new Error("Message not found")
   }
-  async _checkMessageExists({ dateBeforeSend: t, isFirstMessageThread: s, text: a = null, prevTailId: l = null }) {
+  async _checkMessageExists({ dateBeforeSend: t, isFirstMessageThread: s, text: a = null, prevTailId: l = null, hasPreSendSnapshot: h = true }) {
     // v3 verifier: three independent signals instead of one dead one.
     //  - DOM check (legacy, kept): works on some IG builds only
     //  - STORE TEXT: getLastMessagesUnsafe works on current IG (proven in logs)
@@ -1806,11 +1806,15 @@ class Instagram {
       try {
         const msgs = await this.domConnector.send("getLastMessagesUnsafe", {});
         if (msgs?.length) {
-          if (needle) {
-            const texts = msgs.map(m => norm(m.text));
-            storeHit = texts.some(x => x.includes(needle));
+          if (needle && h) {
+            // Only accept a matching message that appeared after the saved tail.
+            // Without this anchor, an older identical DM can make a failed send
+            // look successful and hide the real problem.
+            const tailIndex = l == null ? -1 : msgs.findIndex(m => String(m.messageId) === String(l));
+            const newMessages = tailIndex >= 0 ? msgs.slice(tailIndex + 1) : (l == null ? msgs : []);
+            storeHit = newMessages.some(m => norm(m.text).includes(needle));
           }
-          if (l && String(msgs[msgs.length - 1].messageId) !== String(l)) tailChanged = !0;
+          if (h && l && String(msgs[msgs.length - 1].messageId) !== String(l)) tailChanged = !0;
         }
       } catch (_e) { }
       this.log({
@@ -1900,14 +1904,15 @@ class Instagram {
     text: t,
     username: e
   }) {
-    // ── SIMPLE SEND CONTRACT (2026-08-23 redesign) ──
+    // ── VERIFIED SEND CONTRACT ─────────────────────────────────────────────
     //  1. Type. Loose-compare (whitespace-forgiving): Instagram's editor
     //     normalizes text, and byte-exact demands caused infinite cut/retype
     //     loops. After 3 normalized mismatches we ACCEPT the editor's version —
     //     that IS what will be sent.
     //  2. Press send.
-    //  3. Confirm the ONE truth Instagram gives us: the box empties.
-    //     Emptied = delivered. Still full after 10s = failed -> throw -> retry.
+    //  3. Confirm a new outgoing message exists after the pre-send thread tail.
+    //     A cleared composer only proves the UI accepted the click; it does not
+    //     prove Instagram committed the message.
     const norm = x => String(x ?? "").replace(/\s+/g, " ").trim();
     const expected = norm(t);
     let typed = "";
@@ -1941,24 +1946,34 @@ class Instagram {
       data: { message: typed }
     });
 
+    let beforeMessages = null;
+    try {
+      beforeMessages = await this.domConnector.send("getLastMessagesUnsafe", {});
+    } catch (_e) { }
+    const hasPreSendSnapshot = Array.isArray(beforeMessages);
+    const previousTailId = beforeMessages?.length
+      ? beforeMessages[beforeMessages.length - 1].messageId
+      : null;
+    const sentAt = Date.now();
+
     await this.domConnector.send("sendMessage", {});
-    const deadline = Date.now() + 10000;
-    while (Date.now() < deadline) {
-      await this.sleep(500);
-      let now;
-      try {
-        now = await this.domConnector.send("getMessageInput", {}, { timeoutMs: 8000 });
-      } catch (_e) {
-        continue; // transient read failure — keep watching until deadline
-      }
-      if (!norm(now)) {
-        this.log({ type: "Composer emptied — message sent", data: {} });
-        return !0;
-      }
+    // Match the upstream extension's wait, then use this fork's stronger
+    // DOM/store verifier. The verifier is anchored to the pre-send tail.
+    await this.sleep(5000);
+    const verified = await this._checkMessageExists({
+      dateBeforeSend: sentAt,
+      isFirstMessageThread: hasPreSendSnapshot && beforeMessages.length === 0,
+      text: typed,
+      prevTailId: previousTailId,
+      hasPreSendSnapshot
+    });
+    if (verified) {
+      this.log({ type: "Outgoing message verified in thread", data: { previousTailId } });
+      return !0;
     }
     throw new ExtensionError({
       type: "send_unconfirmed_error",
-      message: "Composer did not empty after send — message likely not delivered"
+      message: "Send was clicked but the outgoing message could not be verified"
     })
   }
   _isClickable(e) {
