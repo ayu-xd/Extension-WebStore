@@ -2,6 +2,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // ── element refs ──
   const $ = id => document.getElementById(id);
   const loginView = $('loginView'), selectView = $('selectView'), activeView = $('activeView');
+  // ── consent view refs ──
+  const consentView = $('consentView');
+  const consentBtn = $('consentBtn');
+  const consentCheckbox = $('consentCheckbox');
+  const privacyPolicyLink = $('privacyPolicyLink');
+  const tosLink = $('tosLink');
   const loginBtn = $('loginBtn'), connectAppBtn = null;
   const forgotLink = $('forgotLink');
   const connectBtn = $('connectBtn'), logoutBtn = $('logoutBtn'), disconnectBtn = null;
@@ -41,12 +47,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   let lastAuthRender = '';
 
   async function renderAuthView() {
-    const snap = await chrome.storage.local.get(['accessToken', 'browserId', 'browserLabel', 'sessionExpired']);
+    const snap = await chrome.storage.local.get(['consentGiven', 'accessToken', 'browserId', 'browserLabel', 'sessionExpired']);
     const sig = `${!!snap.accessToken}|${!!snap.browserId}|${!!snap.sessionExpired}`;
     const entering = sig !== lastAuthRender;
     lastAuthRender = sig;
 
     closeGear();
+
+    // Gate: consent must come first. If not yet given, show consent screen and stop.
+    if (!snap.consentGiven) {
+      showConsentView();
+      return;
+    }
 
     if (!snap.accessToken) {
       showLoginView();
@@ -59,6 +71,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       showConnectingView();
       if (entering) chrome.runtime.sendMessage({ type: 'HUB_CONNECT' });
     }
+  }
+
+  function showConsentView() {
+    loginView.classList.add('hidden');
+    selectView.classList.add('hidden');
+    activeView.classList.add('hidden');
+    logsOverlay.classList.add('hidden');
+    consentView.classList.remove('hidden');
   }
 
   function showLoginView() {
@@ -132,12 +152,36 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // ── logout (gear sheet) ──
   logoutBtn.addEventListener('click', async () => {
+    // Also remove consentGiven so the consent screen re-appears on next login.
+    // This satisfies the Chrome Web Store requirement that consent is re-obtained
+    // if the user fully logs out and starts a new session.
     await chrome.storage.local.remove([
       'accessToken', 'refreshToken', 'sessionExpired',
-      'enginePaused', 'wakeUpAt'
+      'enginePaused', 'wakeUpAt', 'consentGiven'
     ]);
     chrome.runtime.sendMessage({ type: 'HUB_DISCONNECT' });
     showLoginView();
+  });
+
+  // ── consent view handlers ──
+  // Checkbox enables the Continue button
+  consentCheckbox.addEventListener('change', () => {
+    consentBtn.disabled = !consentCheckbox.checked;
+  });
+
+  // Continue button: persist consent and proceed to login
+  consentBtn.addEventListener('click', async () => {
+    if (!consentCheckbox.checked) return;
+    await chrome.storage.local.set({ consentGiven: true });
+    showLoginView();
+  });
+
+  // Links open in a new tab (chrome.tabs.create is required in MV3 popups)
+  privacyPolicyLink.addEventListener('click', () => {
+    chrome.tabs.create({ url: 'https://dmdroid.app/privacy-policy' });
+  });
+  tosLink.addEventListener('click', () => {
+    chrome.tabs.create({ url: 'https://dmdroid.app/terms' });
   });
 
   // ── engine toggle ──

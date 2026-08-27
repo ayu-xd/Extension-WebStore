@@ -104,9 +104,65 @@
     .text-btn { background:none; border:none; color:var(--muted); font-size:12px; cursor:pointer; padding:6px; }
     .text-btn:hover { color:var(--text); }
     .text-btn.off { opacity:.45; }
+
+    /* ── consent view ── */
+    #consentView .consent-body {
+      max-height:240px; overflow-y:auto; background:#0f0f0f;
+      border:1px solid var(--line-soft); border-radius:var(--radius);
+      padding:14px 13px; margin-bottom:16px; font-size:12.5px;
+      color:var(--muted); line-height:1.65;
+    }
+    #consentView .consent-body ul { margin:8px 0 8px 16px; padding:0; }
+    #consentView .consent-body li { margin-bottom:4px; }
+    #consentView .consent-links {
+      display:flex; gap:16px; margin-bottom:16px; font-size:12px;
+    }
+    #consentView .consent-links a {
+      color:var(--primary); text-decoration:underline;
+      text-underline-offset:2px; cursor:pointer;
+    }
+    #consentView .consent-check-row {
+      display:flex; align-items:flex-start; gap:10px;
+      margin-bottom:18px; font-size:12.5px; color:var(--muted);
+      line-height:1.5; cursor:pointer;
+    }
+    #consentView .consent-check-row input[type="checkbox"] {
+      width:16px; height:16px; flex-shrink:0; margin-top:2px;
+      accent-color:var(--primary); cursor:pointer;
+    }
   </style>
 </head>
 <body>
+
+  <!-- ══════════ CONSENT (shown first on fresh install / after logout) ══════════ -->
+  <section id="consentView" class="view hidden">
+    <div class="topbar"><span class="brand">DMDroid</span></div>
+    <div class="consent-body">
+      <p>Before using DMDroid, please review and agree to our
+      <strong>Privacy Policy</strong> and <strong>Terms of Service</strong>.</p>
+      <br>
+      <p>DMDroid will access your Instagram account to:</p>
+      <ul>
+        <li>Send and schedule direct messages on your behalf</li>
+        <li>Read your conversation threads and detect replies</li>
+        <li>Check message read receipts</li>
+        <li>Access your follower and following lists</li>
+      </ul>
+      <br>
+      <p>Your data is processed by Supabase (our backend provider)
+      and is never sold to third parties. Local data (auth tokens, logs)
+      stays on your device.</p>
+    </div>
+    <div class="consent-links">
+      <a id="privacyPolicyLink">Privacy Policy</a>
+      <a id="tosLink">Terms of Service</a>
+    </div>
+    <label class="consent-check-row">
+      <input type="checkbox" id="consentCheckbox">
+      <span>I have read and agree to the Privacy Policy and Terms of Service</span>
+    </label>
+    <button id="consentBtn" class="primary-btn" disabled>Continue</button>
+  </section>
 
   <!-- ══════════ LOGIN ══════════ -->
   <section id="loginView" class="view hidden">
