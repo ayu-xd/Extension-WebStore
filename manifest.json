@@ -2,7 +2,7 @@
 	"manifest_version": 3,
 	"name": "DMDroid",
 	"short_name": "DMDroid",
-	"version": "1.4.1",
+	"version": "1.4.2",
 	"description": "Your Instagram DM follow-up assistant — schedule first touches and follow-ups, track replies, and stay organized.",
 	"icons": {
 		"16": "icons/icon-16x16.png",
