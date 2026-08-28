@@ -688,6 +688,7 @@ async function collectMessagesJob() {
 // 7-day expiry for tasks stranded by an offline browser.
 let _uniboxInFlight = false;
 let _uniboxLastSendAt = 0;
+let _uniboxInFlightTaskId = null;
 
 async function pollUniboxReplies() {
   if (!state.browserId || !state.mainTabId) return;
@@ -719,7 +720,17 @@ async function pollUniboxReplies() {
 
     _uniboxInFlight = true;
     try {
-      await supabaseReq(`dm_tasks?id=eq.${rt.id}`, "PATCH", { status: "processing", claimed_at: nowIso });
+      // Conditional claim: a second worker/poll can never deliver the same
+      // pending reply after this worker has claimed it.
+      const claimed = await supabaseReq(`dm_tasks?id=eq.${rt.id}&status=eq.pending`, "PATCH", {
+        status: "processing",
+        claimed_at: nowIso
+      });
+      if (!claimed?.length) {
+        dlog("unibox_claim_lost", { taskId: rt.id }, "warn");
+        return;
+      }
+      _uniboxInFlightTaskId = rt.id;
       await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}&send_status=eq.queued`, "PATCH", { send_status: "sending" });
 
       // resolve lead handle from contact relation
@@ -751,15 +762,40 @@ async function pollUniboxReplies() {
         throw new Error(res?.error?.error || "content script reported failure");
       }
 
-      // ── DELIVERED ── The composer contract confirmed the send inside the
-      // content script, so this task can NEVER be retried from here on.
-      // Everything below is best-effort bookkeeping: a cleanup failure is
-      // logged and swallowed — it must never re-fire a delivered DM.
+      // ── DELIVERED ── The composer contract confirmed the physical send.
+      // Completion bookkeeping must be terminal too: if the database rejects
+      // `completed`, quarantine the task as a confirmed delivery rather than
+      // leaving it processing for a scheduler to resend.
       _uniboxLastSendAt = Date.now();
+      const completedAt = new Date().toISOString();
       try {
-        await supabaseReq(`dm_tasks?id=eq.${rt.id}`, "PATCH", { status: "completed", completed_at: new Date().toISOString() });
+        const completed = await supabaseReq(`dm_tasks?id=eq.${rt.id}&status=eq.processing`, "PATCH", {
+          status: "completed",
+          completed_at: completedAt,
+          error_reason: null
+        });
+        if (!completed?.length) throw new Error("completion update affected no processing row");
       } catch (e) {
-        debugLog(`[Unibox] non-fatal: could not mark task completed: ${e.message}`);
+        const reason = `delivery_confirmed_bookkeeping_failed: ${String(e?.message || e).slice(0, 180)}`;
+        try {
+          const quarantined = await supabaseReq(`dm_tasks?id=eq.${rt.id}&status=eq.processing`, "PATCH", {
+            status: "failed",
+            completed_at: completedAt,
+            error_reason: reason
+          });
+          if (!quarantined?.length) throw new Error("terminal quarantine affected no processing row");
+          dlog("unibox_delivery_quarantined", { taskId: rt.id, reason }, "error");
+          debugLog(`[Unibox] delivery was verified but completion bookkeeping failed; task quarantined: ${reason}`);
+        } catch (quarantineErr) {
+          // This is a true operational emergency: never pretend the task is
+          // settled, and leave an explicit diagnostic trail for manual repair.
+          dlog("unibox_delivery_quarantine_failed", {
+            taskId: rt.id,
+            completionError: String(e?.message || e).slice(0, 180),
+            quarantineError: String(quarantineErr?.message || quarantineErr).slice(0, 180)
+          }, "error");
+          debugLog(`[Unibox] CRITICAL: verified delivery could not be made terminal: ${quarantineErr.message}`);
+        }
       }
       // Swap the synthetic queued bubble for the real harvested row. If the
       // DELETE fails, at least flip it to 'sent' so the UI never shows a
@@ -816,7 +852,10 @@ async function pollUniboxReplies() {
         debugLog(`[Unibox] reply ${rt.id} permanently failed: ${msg}`);
       }
     } finally {
-      setTimeout(() => { _uniboxInFlight = false; }, 45000); // hot-lead gap
+      setTimeout(() => {
+        _uniboxInFlight = false;
+        _uniboxInFlightTaskId = null;
+      }, 45000); // hot-lead gap
     }
   } catch (outer) {
     debugLog(`[Unibox] poll error: ${outer.message}`);
@@ -2360,14 +2399,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // delivery_unknown. We intentionally never revive arbitrary failed rows.
     if (taskType === "successTask" || taskType === "errorTask") {
       if (taskType === "successTask" && taskData?.taskId) {
-        const completion = { status: "completed", completed_at: new Date().toISOString(), error_reason: null };
-        // Normal completion path (including the Promise listener race).
-        supabaseReq(`dm_tasks?id=eq.${taskData.taskId}&status=eq.processing`, "PATCH", completion).catch(() => {});
-        // Late success after a timeout: only absorb the narrow fail-closed state
-        // created above, never a real permanent failure. This also performs the
-        // normal contact/follow-up completion bookkeeping the timed-out poller
-        // could no longer reach.
-        settleLateVerifiedDelivery(taskData.taskId).catch(() => {});
+        if (taskData.taskId === _uniboxInFlightTaskId) {
+          // Unibox owns its completion in pollUniboxReplies. Letting this
+          // generic path also PATCH it caused duplicate completion-trigger
+          // calls for each Unibox reply.
+          dlog("unibox_success_deferred", { taskId: taskData.taskId });
+        } else {
+          const completion = { status: "completed", completed_at: new Date().toISOString(), error_reason: null };
+          // Normal completion path (including the Promise listener race).
+          supabaseReq(`dm_tasks?id=eq.${taskData.taskId}&status=eq.processing`, "PATCH", completion).catch(() => {});
+          // Late success after a timeout: only absorb the narrow fail-closed state
+          // created above, never a real permanent failure. This also performs the
+          // normal contact/follow-up completion bookkeeping the timed-out poller
+          // could no longer reach.
+          settleLateVerifiedDelivery(taskData.taskId).catch(() => {});
+        }
       }
       sendResponse({ success: true });
       return;
