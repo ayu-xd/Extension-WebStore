@@ -2037,32 +2037,73 @@ function randUrl() {
 async function openTab(type, targetUrl = null) {
   const stateKey = type === 'main' ? 'mainTabId' : 'additionalTabId';
 
+  // MV3 service workers are routinely suspended while Chrome is in the
+  // background. Refresh the durable tab ID on every dispatch so a revived
+  // worker keeps using the tab it created before suspension.
+  const storedTab = await chrome.storage.local.get(stateKey);
+  if (storedTab[stateKey]) state[stateKey] = storedTab[stateKey];
+
   if (state[stateKey]) {
+    let tab = null;
     try {
-      const tab = await chrome.tabs.get(state[stateKey]);
-      if (tab && !tab.discarded) {
-        // For the additional tab with no explicit target, force-navigate to the DM
-        // inbox so we never reuse a stale thread page from a previous task. The
-        // content script then opens the correct thread live by username.
-        const effectiveUrl = targetUrl || (type === 'additional' ? "https://www.instagram.com/direct/inbox/" : null);
-        debugLog(`Reusing existing ${type} tab ${state[stateKey]}`);
-        dlog("tab_reuse", { tabType: type, tabId: state[stateKey], currentUrl: tab.url || null });
-        if (effectiveUrl && tab.url !== effectiveUrl) {
-          debugLog(`Navigating ${type} tab to target URL: ${effectiveUrl}`);
-          dlog("tab_navigate", { tabType: type, tabId: state[stateKey], url: effectiveUrl }, "warn");
-          await chrome.tabs.update(tab.id, { url: effectiveUrl });
+      tab = await chrome.tabs.get(state[stateKey]);
+    } catch (e) {
+      // Create a replacement only when Chrome confirms the stored tab is gone.
+      const missingTabId = state[stateKey];
+      state[stateKey] = null;
+      await chrome.storage.local.remove(stateKey);
+      dlog("tab_missing_replaced", {
+        tabType: type,
+        tabId: missingTabId,
+        reason: String(e?.message || e).slice(0, 160)
+      }, "warn");
+    }
+
+    if (tab) {
+      // A discarded tab is still the user's pinned tab. Wake it and let the
+      // normal ping/reload path below verify the content script; never create
+      // a duplicate pinned tab merely because Chrome unloaded its renderer.
+      if (tab.discarded) {
+        dlog("tab_discarded_recovered", { tabType: type, tabId: tab.id, currentUrl: tab.url || null }, "warn");
+        try {
+          await chrome.tabs.reload(tab.id);
           for (let i = 0; i < 25; i++) {
-            try {
-              const t = await chrome.tabs.get(tab.id);
-              if (t.status === "complete") break;
-            } catch (e) { break; }
+            const reloaded = await chrome.tabs.get(tab.id).catch(() => null);
+            if (!reloaded) break;
+            if (reloaded.status === "complete" && !reloaded.discarded) break;
             await sleep(400);
           }
+        } catch (e) {
+          // Do not replace a tab solely because waking it failed. The existing
+          // sendTaskToContent ping/reload recovery will make the final decision.
+          dlog("tab_discarded_wake_failed", {
+            tabType: type,
+            tabId: tab.id,
+            reason: String(e?.message || e).slice(0, 160)
+          }, "warn");
         }
-        return state[stateKey];
       }
-    } catch (e) {
-      state[stateKey] = null;
+
+      // For the additional tab with no explicit target, force-navigate to the DM
+      // inbox so we never reuse a stale thread page from a previous task. The
+      // content script then opens the correct thread live by username.
+      const effectiveUrl = targetUrl || (type === 'additional' ? "https://www.instagram.com/direct/inbox/" : null);
+      debugLog(`Reusing existing ${type} tab ${tab.id}`);
+      dlog("tab_reused", { tabType: type, tabId: tab.id, currentUrl: tab.url || null, wasDiscarded: Boolean(tab.discarded) });
+      dlog("tab_reuse", { tabType: type, tabId: tab.id, currentUrl: tab.url || null });
+      if (effectiveUrl && tab.url !== effectiveUrl) {
+        debugLog(`Navigating ${type} tab to target URL: ${effectiveUrl}`);
+        dlog("tab_navigate", { tabType: type, tabId: tab.id, url: effectiveUrl }, "warn");
+        await chrome.tabs.update(tab.id, { url: effectiveUrl });
+        for (let i = 0; i < 25; i++) {
+          try {
+            const t = await chrome.tabs.get(tab.id);
+            if (t.status === "complete") break;
+          } catch (e) { break; }
+          await sleep(400);
+        }
+      }
+      return tab.id;
     }
   }
 
@@ -2468,8 +2509,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
-  if (state.mainTabId === tabId) state.mainTabId = null;
-  if (state.additionalTabId === tabId) state.additionalTabId = null;
+  if (state.mainTabId === tabId) {
+    state.mainTabId = null;
+    chrome.storage.local.remove('mainTabId').catch(() => null);
+  }
+  if (state.additionalTabId === tabId) {
+    state.additionalTabId = null;
+    chrome.storage.local.remove('additionalTabId').catch(() => null);
+  }
 });
 
 // Boot
