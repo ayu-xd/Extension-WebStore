@@ -951,16 +951,48 @@ async function syncUniboxThreads(data) {
       fresh.sort((a, b) => a.ts_ms - b.ts_ms);
       const windowed = fresh.slice(-30); // rolling window cap
 
+      // ── ENRICHMENT (v1.4.3): attribute the campaign and resolve the lead's
+      // real name/avatar so the dashboard inbox can show both. Two tiny
+      // owner-scoped lookups keyed on the contact PK, run ONLY for threads
+      // that have fresh messages (idle threads cost nothing). Any failure
+      // here must degrade to the pre-v1.4.3 behavior — nulls — never abort
+      // the sync; the RPC coalesces, so nulls also can't clobber values that
+      // were already written by a previous sync or the SQL backfill.
+      let enrichCampaignId = null;
+      let enrichFullName = null;
+      let enrichAvatarUrl = null;
+      try {
+        const [contactRows, campaignRows] = await Promise.all([
+          supabaseReq(`contacts?select=full_name,image_url&id=eq.${contactId}&user_id=eq.${ctx.userId}&limit=1`),
+          supabaseReq(`dm_tasks?select=campaign_id&contact_id=eq.${contactId}&campaign_id=not.is.null&order=created_at.desc&limit=1`)
+        ]);
+        enrichFullName = (contactRows?.[0]?.full_name || "").trim() || null;
+        enrichAvatarUrl = contactRows?.[0]?.image_url || null;
+        enrichCampaignId = campaignRows?.[0]?.campaign_id || null;
+        dlog("unibox_thread_enriched", {
+          target: handle,
+          hasCampaign: !!enrichCampaignId,
+          hasName: !!enrichFullName,
+          hasAvatar: !!enrichAvatarUrl
+        });
+      } catch (enrichErr) {
+        // Fail-open: sync continues with nulls (identical to pre-v1.4.3 behavior).
+        dlog("unibox_enrich_failed", {
+          target: handle,
+          error: String(enrichErr?.message || enrichErr).slice(0, 180)
+        }, "warn");
+      }
+
       const payload = {
         user_id: ctx.userId,
         contact_id: contactId,
-        campaign_id: null,
+        campaign_id: enrichCampaignId,
         browser_instance_id: state.browserId,
         account_ig_username: ctx.accountUsername,
         thread_id: String(info.thread_key),
         target_username: targetUsername,
-        target_full_name: null,
-        target_profile_pic_url: null,
+        target_full_name: enrichFullName,
+        target_profile_pic_url: enrichAvatarUrl,
         messages: windowed
       };
       const res = await supabaseReq(`rpc/sync_unibox_thread`, "POST", {
