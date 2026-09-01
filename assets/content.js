@@ -761,21 +761,16 @@ class Instagram {
 
         var d, l, h;
         if (this.isBusy) {
-          // ── RELIABILITY FIX (root cause of double-text) ──────────────────────────────
-          // Never throw on isBusy. Throwing causes BackgroundConnector.processMessage to
-          // return {success:false}, which immediately rejects the background's executeTask
-          // Promise, releases state.isProcessing, and 15 s later re-claims this same task
-          // into a still-busy tab — all while this content script is still mid-send.
-          // That concurrent execution is what delivers the "3 bubbles sent again and again".
-          //
-          // Returning silently keeps {success:true} flowing back so:
-          //   • The background's Promise stays alive, waiting on successTask/errorTask.
-          //   • state.isProcessing stays locked — no new polls can fire.
-          //   • The currently-running task emits its own successTask/errorTask, which
-          //     the waiting Promise hears and resolves cleanly. One send. Done.
-          // ─────────────────────────────────────────────────────────────────────────────
-          this.log({ type: "[sendMessage] Thread busy — returning silently; background holds its Promise", data: { currentTaskId: this.taskId, incomingTaskId: s } });
-          return;
+          // E-01 FIX: throw thread_busy instead of returning silently.
+          // The prior silent-return was safe when the background held its Promise forever,
+          // but the 16-min lock auto-recovery changed that contract: it resets isProcessing
+          // and immediately claims a NEW task into a still-busy tab — the silent return
+          // made the background think dispatch succeeded, then waited 10 min for a taskId
+          // that could never arrive, settling as delivery_unknown (lost task).
+          // Throwing propagates through errorTask → isThreadBusy branch (background.js:1522)
+          // → re-queues as pending with 60 s backoff. No double-send, no lost task.
+          this.log({ type: "Got send message task but thread is busy", data: { currentTaskId: this.taskId, incomingTaskId: s } });
+          throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
         }
         try {
           this.log({ type: "[sendMessage] Entering try block, setting isBusy = true", data: {} });
@@ -830,9 +825,21 @@ class Instagram {
               })) {
               if (n) {
                 this.log({ type: "[Followup] isOpenNewTab set — scraping LIVE thread id from search dialog", data: { username: e.username, taskId: s } });
-                h = await this.domConnector.send("findUserInDialogWithoutClick", {
-                  username: e.username
-                }, { timeoutMs: 240000 });
+                // F-THROW-GUARD: findUserInDialogWithoutClick can throw user_click_error
+                // when Instagram's fiber structure doesn't expose candidate.candidate.id
+                // (logs show matched:true but threadId:null — the fiber finds the row
+                // but crashes reading the id). Previously this throw escaped the if(n)
+                // block entirely, bypassing the openUser fallback below. Now we convert
+                // any throw to h=null so the null-threadId path below runs instead,
+                // which is the same path all successful followups already take.
+                try {
+                  h = await this.domConnector.send("findUserInDialogWithoutClick", {
+                    username: e.username
+                  }, { timeoutMs: 240000 });
+                } catch (_dialogThrowErr) {
+                  this.log({ type: "[Followup] findUserInDialogWithoutClick threw — treating as null threadId", data: { username: e.username, taskId: s, error: String(_dialogThrowErr?.message || _dialogThrowErr) } });
+                  h = null;
+                }
                 var _liveThreadId = h?.candidate?.id ?? null;
                 this.log({ type: "[Followup] Live thread id scraped from search results", data: { username: e.username, taskId: s, threadId: _liveThreadId, matched: !!h?.candidate } });
                 if (_liveThreadId) {
@@ -1131,11 +1138,10 @@ class Instagram {
 
         var i;
         if (this.isBusy) {
-          // Silent return — same rationale as sendMessage. Never throw on isBusy.
-          // The background keeps its Promise alive; the active task finishes and
-          // emits successTask/errorTask which resolves the waiting Promise cleanly.
-          this.log({ type: "[sendMessageFromDialog] Thread busy — returning silently", data: { currentTaskId: this.taskId, incomingTaskId: s } });
-          return;
+          // E-01 FIX: throw thread_busy (same fix as sendMessage — see that handler for
+          // the full rationale). The lock auto-recovery makes silent-return a task killer.
+          this.log({ type: "Got send message task but thread is busy", data: { currentTaskId: this.taskId, incomingTaskId: s } });
+          throw new ExtensionError({ type: "thread_busy", message: "Content script thread is busy with another task" });
         }
         try {
           // Set the busy lock FIRST (before any await) so no second task can
@@ -2017,9 +2023,11 @@ class Instagram {
       const message = t
         .replace(/\{\{\s*username\s*\}\}/gi, () => e)
         .replace(/\{\{\s*name\s*\}\}/gi, () => s?.full_name ?? e)
-        .replace(/[ \t]*\{\{\s*firstName\s*\}\}[ \t]*/g, (m) =>
+        // E-09 FIX: added `i` flag — users write {{FirstName}} (capital F),
+        // the old regex only matched camelCase `firstName` causing literal tokens to ship.
+        .replace(/[ \t]*\{\{\s*firstName\s*\}\}[ \t]*/gi, (m) =>
           fn
-            ? m.replace(/\{\{\s*firstName\s*\}\}/, fn)
+            ? m.replace(/\{\{\s*firstName\s*\}\}/i, fn)
             : /^[ \t]/.test(m) && /[ \t]$/.test(m) ? " " : "");
       this.log({ type: "Resolved live name from Instagram", data: { fullName: s.full_name, message } });
       return { message, fullName: s.full_name || null };
@@ -2027,7 +2035,9 @@ class Instagram {
     const message = t
       .replace(/\{\{\s*username\s*\}\}/gi, () => e)
       .replace(/\{\{\s*name\s*\}\}/gi, () => e)
-      .replace(/[ \t]*\{\{\s*firstName\s*\}\}[ \t]*/g, (m) =>
+      // E-09 FIX: added `i` flag — same fix as fill branch above.
+      // Without this, {{FirstName}} (capital F) survived the strip and shipped literally.
+      .replace(/[ \t]*\{\{\s*firstName\s*\}\}[ \t]*/gi, (m) =>
         /^[ \t]/.test(m) && /[ \t]$/.test(m) ? " " : "");
     this.log({ type: "getUserByUsername failed — stripped unresolved placeholders", data: { message } });
     return { message, fullName: null };

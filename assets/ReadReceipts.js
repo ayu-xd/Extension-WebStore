@@ -180,7 +180,15 @@
         let hasReply = false;
         for (const [msgId, msg] of Object.entries(messages)) {
           if (msg.thread_fbid !== thread.id && msg.thread_fbid !== threadRelayId) continue;
-          if (msg.sender_fbid === threadKey) {
+          // REPLY-GUARD: only count inbound messages that arrived AFTER our last
+          // outbound message. Without this, any pre-existing message from an old
+          // conversation in the Relay Store is incorrectly flagged as a campaign
+          // reply, permanently marking the contact as replied and cancelling all
+          // their pending followups. ourLastMessageTimestamp > 0 ensures we never
+          // flag a reply on a thread where we haven't sent anything yet.
+          if (msg.sender_fbid === threadKey &&
+              ourLastMessageTimestamp > 0 &&
+              Number(msg.timestamp_ms) > ourLastMessageTimestamp) {
             hasReply = true;
             break;
           }

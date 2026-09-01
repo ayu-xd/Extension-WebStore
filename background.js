@@ -147,6 +147,28 @@ async function syncStatsFromDatabase() {
 // ---------------------------------------------------------------------------
 // Supabase REST Client
 // ---------------------------------------------------------------------------
+
+// E-07 FIX: network retry layer (2 attempts) wrapping every fetch() call.
+// Absorbs transient network drops and 5xx/429 responses before they reach
+// the auth logic that previously wiped tokens on any TypeError.
+async function fetchWithRetry(url, options, attempts = 2) {
+  for (let i = 0; ; i++) {
+    try {
+      const res = await fetch(url, options);
+      if ((res.status === 429 || res.status >= 500) && i < attempts) {
+        const retryAfterRaw = res.headers.get('retry-after');
+        const retryAfterMs = retryAfterRaw ? Number(retryAfterRaw) * 1000 : 1000 * (i + 1);
+        await sleep(Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 1000 * (i + 1));
+        continue;
+      }
+      return res;
+    } catch (e) {
+      if (i >= attempts || e.name === 'AbortError') throw e;
+      await sleep(1000 * (i + 1));
+    }
+  }
+}
+
 async function supabaseReq(path, method = "GET", body = null, _retried = false) {
   const headers = {
     "apikey": SUPABASE_ANON_KEY,
@@ -157,14 +179,15 @@ async function supabaseReq(path, method = "GET", body = null, _retried = false) 
   const options = { method, headers };
   if (body) options.body = JSON.stringify(body);
 
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, options);
+  const res = await fetchWithRetry(`${SUPABASE_URL}/rest/v1/${path}`, options);
   if (res.status === 401 && !_retried && state.refreshToken) {
     debugLog("Token expired, refreshing...");
-    const refreshed = await refreshAccessToken();
+    const refreshed = await refreshAccessTokenSingleFlight();
     if (refreshed) return supabaseReq(path, method, body, true);
   }
   if (!res.ok) {
-    throw new Error(`Supabase error: ${res.status} ${res.statusText}`);
+    const bodyText = await res.text().catch(() => '');
+    throw new Error(`Supabase error: ${res.status} ${res.statusText}${bodyText ? ` | ${bodyText.slice(0, 200)}` : ''}`);
   }
   return res.json();
 }
@@ -179,16 +202,17 @@ async function supabaseUpsert(path, body, onConflict, _retried = false) {
     "Content-Type": "application/json",
     "Prefer": "resolution=merge-duplicates,return=representation"
   };
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}?on_conflict=${onConflict}`, {
+  const res = await fetchWithRetry(`${SUPABASE_URL}/rest/v1/${path}?on_conflict=${onConflict}`, {
     method: "POST", headers, body: JSON.stringify(body)
   });
   if (res.status === 401 && !_retried && state.refreshToken) {
     debugLog("Token expired, refreshing...");
-    const refreshed = await refreshAccessToken();
+    const refreshed = await refreshAccessTokenSingleFlight();
     if (refreshed) return supabaseUpsert(path, body, onConflict, true);
   }
   if (!res.ok) {
-    throw new Error(`Supabase upsert error: ${res.status} ${res.statusText}`);
+    const bodyText = await res.text().catch(() => '');
+    throw new Error(`Supabase upsert error: ${res.status} ${res.statusText}${bodyText ? ` | ${bodyText.slice(0, 200)}` : ''}`);
   }
   return res.json();
 }
@@ -282,6 +306,16 @@ async function refreshAccessToken() {
     debugLog("Token refreshed!");
     return true;
   } catch (err) {
+    // E-07 FIX: split network errors (TypeError: Failed to fetch) from genuine
+    // auth rejections (4xx from the endpoint). A transient network drop says
+    // nothing about auth validity — wiping tokens on every catch caused the
+    // Aug 30 2:48 PM forced-logout and 2.5h manual re-login window.
+    const isNetworkError = err instanceof TypeError || /failed to fetch/i.test(String(err?.message || err));
+    if (isNetworkError) {
+      debugLog(`Refresh network error (transient): ${err.message} — keeping tokens, will retry later.`);
+      return false; // DO NOT touch tokens, DO NOT set sessionExpired, DO NOT stopEngine
+    }
+    // Genuine auth rejection (invalid_grant, 4xx from Supabase auth endpoint).
     debugLog(`Refresh failed: ${err.message}`);
     // Session honesty: mark as expired so the popup shows the native login
     // instead of a fake "Online" state. Single atomic write — no window where
@@ -294,6 +328,33 @@ async function refreshAccessToken() {
     debugLog("[Session] Marked as expired. Popup will show login.");
     return false;
   }
+}
+
+// E-08 FIX: single-flight mutex for refreshAccessToken.
+// Supabase rotates refresh tokens single-use. When heartbeat, pollTasks and init
+// all race to refresh simultaneously, the losers present the now-stale token
+// and get a 400 — which the old catch-all misread as session-expired, nuking
+// the session the winner just renewed. Single-flight ensures everyone awaits
+// the SAME promise and only one HTTP call ever goes out per rotation cycle.
+let _refreshInFlight = null;
+async function refreshAccessTokenSingleFlight() {
+  if (_refreshInFlight) return _refreshInFlight; // everyone awaits the same promise
+  _refreshInFlight = (async () => {
+    try {
+      // Re-read tokens from storage first — another context may have just rotated them
+      const stored = await chrome.storage.local.get(['accessToken', 'refreshToken']);
+      if (stored.refreshToken && stored.refreshToken !== state.refreshToken) {
+        // Someone else already refreshed; adopt their new pair and skip the round-trip.
+        state.accessToken = stored.accessToken;
+        state.refreshToken = stored.refreshToken;
+        return true;
+      }
+      return await refreshAccessToken();
+    } finally {
+      _refreshInFlight = null;
+    }
+  })();
+  return _refreshInFlight;
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +387,7 @@ async function init() {
   }
 
   if (state.refreshToken && state.browserId) {
-    const refreshed = await refreshAccessToken();
+    const refreshed = await refreshAccessTokenSingleFlight();
     if (refreshed) {
       startEngine();
       await syncStatsFromDatabase();
@@ -342,7 +403,7 @@ async function init() {
     if (data.disconnectedByUser) {
       debugLog("[Init] User disconnected — staying unlinked until Reconnect.");
     } else {
-      if (state.refreshToken) await refreshAccessToken();
+      if (state.refreshToken) await refreshAccessTokenSingleFlight();
       if (state.accessToken) await ensurePairedRow();
     }
   }
@@ -649,7 +710,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   } else if (alarm.name === "engine_refresh_token") {
     // Firm-hold login: the extension owns its own token family (independent
     // of the web app's). Refresh it unconditionally on schedule.
-    refreshAccessToken().catch(() => { });
+    refreshAccessTokenSingleFlight().catch(() => { });
   } else if (alarm.name === "engine_collect_messages") {
     collectMessagesJob().catch(() => { });
   }
@@ -797,23 +858,41 @@ async function pollUniboxReplies() {
           debugLog(`[Unibox] CRITICAL: verified delivery could not be made terminal: ${quarantineErr.message}`);
         }
       }
-      // Swap the synthetic queued bubble for the real harvested row. If the
-      // DELETE fails, at least flip it to 'sent' so the UI never shows a
-      // stale Queued state for a message Instagram already has.
-      let deleted = false;
+      // ── POST-DELIVERY BUBBLE RECONCILIATION ──────────────────────────────
+      // Keep the synthetic ig_messages bubble alive and flip it to 'sent'
+      // so the web app chat window immediately shows the outgoing reply with
+      // a ✓ tick. DO NOT delete it — deleting it leaves the conversation
+      // preview stale and makes the message invisible until the next periodic
+      // sync cycle (up to 2 min).
+      //
+      // The next `collectMessages` alarm (every 2 min) will call
+      // _emitUniboxCapture → syncUniboxThreads, which upserts the REAL
+      // Instagram message_id row via `ON CONFLICT DO NOTHING`. When that
+      // happens the synthetic bubble becomes an orphan (its dm_task_id is
+      // no longer needed) but it remains harmlessly visible — the real row
+      // lands alongside it with the correct message_id. This is acceptable:
+      // duplicates are preferable to invisible messages.
+      //
+      // To give the web app an instant update we also kick off an immediate
+      // capture of just this thread right now, without waiting for the alarm.
       try {
-        await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}`, "DELETE");
-        deleted = true;
+        await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}`, "PATCH", { send_status: "sent" });
       } catch (e) {
-        debugLog(`[Unibox] non-fatal: synthetic delete failed: ${e.message}`);
+        debugLog(`[Unibox] non-fatal: sent-flip failed: ${e.message}`);
       }
-      if (!deleted) {
-        try {
-          await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}`, "PATCH", { send_status: "sent" });
-        } catch (e) {
-          debugLog(`[Unibox] non-fatal: synthetic sent-flip failed: ${e.message}`);
-        }
+
+      // Immediate post-delivery capture — harvests the just-sent message from
+      // the IG React store and writes the real row to ig_messages right away.
+      // Best-effort: failure here is non-fatal (the periodic alarm is the backstop).
+      if (state.mainTabId) {
+        chrome.tabs.sendMessage(state.mainTabId, {
+          type: "adblock:info:to-content",
+          isEmit: true,
+          data: { type: "collectMessages", data: { targetUsername } }
+        }).catch(() => null);
+        debugLog(`[Unibox] triggered immediate capture for @${targetUsername} after delivery.`);
       }
+
       debugLog(`[Unibox] reply delivered to @${targetUsername}.`);
     } catch (err) {
       const msg = String(err?.message || err);
@@ -1329,6 +1408,20 @@ async function pollTasks() {
 
   if (state.isProcessing) {
     if (Date.now() - state.processingLockAcquiredAt > 960000) { // 16 min: just above the 15-min task timeout
+      // E-01 Part 2 FIX: before recovering, check whether the content script is
+      // still legitimately busy (a real 45-60 min task). If it is, extend the
+      // lock instead of claiming a new task into a still-busy tab.
+      const inFlightData = await chrome.storage.local.get('inFlightTaskId');
+      if (inFlightData.inFlightTaskId) {
+        const pingRes = await sendToContentLite('main', 'ping', {}).catch(() => null);
+        if (pingRes) {
+          // Content script alive and working — extend the lock, don't steal it.
+          state.processingLockAcquiredAt = Date.now();
+          dlog("lock_extended_busy_guard", { inFlightTaskId: inFlightData.inFlightTaskId }, "warn");
+          debugLog(`[System] Lock recovery skipped — content script is still busy with task ${inFlightData.inFlightTaskId}. Extending lock.`);
+          return;
+        }
+      }
       debugLog(`[System] Auto-recovering locked engine.`);
       state.isProcessing = false;
     } else {
@@ -1413,6 +1506,9 @@ async function pollTasks() {
     }
 
     await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "processing", claimed_at: new Date().toISOString() });
+    // E-01 Part 2 FIX: persist the in-flight task ID so a revived worker can
+    // check whether a task is still running before stealing the lock.
+    await chrome.storage.local.set({ inFlightTaskId: task.id });
 
     debugLog(`Processing task: ${task.task_type}`);
     const taskStartedAt = Date.now();
@@ -1526,7 +1622,7 @@ async function pollTasks() {
         // Back off 60 s before next poll. Without this the 15 s alarm immediately
         // re-claims the same task into a still-busy tab, producing the thread_busy
         // hammer loop. This is a safety net for any edge-case where thread_busy still
-        // surfaces; the primary fix is the silent-return in content.js isBusy guards.
+        // surfaces; the primary fix is now the throw in content.js isBusy guards.
         await setWake('busy_backoff', Date.now() + 60_000);
       } else {
         const isPermanentError = [
@@ -1538,6 +1634,17 @@ async function pollTasks() {
         ].includes(retryClass);
 
         const currentRetries = Number(task.retry_count || 0);
+
+        // E-04 FIX: for user_click_error retries, navigate the main tab to a
+        // fresh inbox page before scheduling the retry. The same degraded React
+        // fiber state causes deterministic failure if the tab is reused as-is.
+        if (retryClass === "user_click_error" && state.mainTabId && currentRetries < 3) {
+          try {
+            await chrome.tabs.update(state.mainTabId, { url: "https://www.instagram.com/direct/inbox/" });
+            dlog("tab_freshened_for_retry", { tabId: state.mainTabId, retryClass }, "warn");
+            debugLog(`[E-04] Freshening main tab for user_click_error retry.`);
+          } catch (e) { /* non-fatal — tab may be gone; next openTab call will recover */ }
+        }
 
         if (!isPermanentError && currentRetries < 3) {
           const nextRetry = currentRetries + 1;
@@ -1576,6 +1683,10 @@ async function pollTasks() {
           debugLog(`Task Permanently Failed: ${err.message} ${retryClass ? `[${retryClass}]` : ''}`);
         }
       }
+    } finally {
+      // E-01 Part 2 FIX: always clear the in-flight task ID on both success and
+      // error paths so the lock-recovery busy guard doesn't block on a finished task.
+      await chrome.storage.local.remove('inFlightTaskId').catch(() => {});
     }
 
     await chrome.storage.local.set({ stats: state.stats });
@@ -1669,7 +1780,7 @@ async function executeTask(task) {
             if (resolved) return;
             resolved = true;
             chrome.runtime.onMessage.removeListener(handler);
-            clearTimeout(timeoutId);
+            chrome.alarms.clear(alarmName).catch(() => {});
 
             const data = payload.data;
             dlog("content_success", {
@@ -1767,7 +1878,7 @@ async function executeTask(task) {
             if (resolved) return;
             resolved = true;
             chrome.runtime.onMessage.removeListener(handler);
-            clearTimeout(timeoutId);
+            chrome.alarms.clear(alarmName).catch(() => {});
 
             const errReason = payload.data.error || "DM failed";
             dlog("content_error", {
@@ -1789,18 +1900,12 @@ async function executeTask(task) {
         }
       };
 
-      const timeoutId = setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          chrome.runtime.onMessage.removeListener(handler);
-          // A browser-throttled, multi-bubble DM took just over six minutes in production.
-          // Ten minutes leaves room for that without making a genuinely dead task wait for
-          // the old 15-minute window. Timeout outcomes are settled as delivery_unknown,
-          // never retried as a new physical send.
-          dlog("task_timeout", { taskId: task.id, taskType: task.task_type, waitedMs: 600000 }, "warn");
-          reject(new Error("Task timed out waiting for content script response"));
-        }
-      }, 600000);
+      // E-05 FIX: use chrome.alarms instead of setTimeout so the watchdog
+      // survives MV3 service-worker suspension. A suspended worker loses all
+      // setTimeout callbacks; the alarm fires as soon as the worker revives,
+      // producing elapsedMs close to waitedMs instead of 10-18x overruns.
+      const alarmName = `task_watchdog_${task.id}`;
+      chrome.alarms.create(alarmName, { when: Date.now() + 600000 });
 
       chrome.runtime.onMessage.addListener(handler);
 
@@ -1811,7 +1916,7 @@ async function executeTask(task) {
             if (!resolved) {
               resolved = true;
               chrome.runtime.onMessage.removeListener(handler);
-              clearTimeout(timeoutId);
+              chrome.alarms.clear(alarmName).catch(() => {});
               reject(new Error(res?.error?.error || "Send message failed to start"));
             }
           }
@@ -1819,7 +1924,7 @@ async function executeTask(task) {
           if (!resolved) {
             resolved = true;
             chrome.runtime.onMessage.removeListener(handler);
-            clearTimeout(timeoutId);
+            chrome.alarms.clear(alarmName).catch(() => {});
             reject(err);
           }
         }
@@ -1869,7 +1974,7 @@ async function executeTask(task) {
             if (resolved) return;
             resolved = true;
             chrome.runtime.onMessage.removeListener(handler);
-            clearTimeout(timeoutId);
+            chrome.alarms.clear(alarmName).catch(() => {});
 
             const data = payload.data;
             dlog("content_success", {
@@ -1924,7 +2029,7 @@ async function executeTask(task) {
             if (resolved) return;
             resolved = true;
             chrome.runtime.onMessage.removeListener(handler);
-            clearTimeout(timeoutId);
+            chrome.alarms.clear(alarmName).catch(() => {});
 
             dlog("content_error", {
               taskId: task.id,
@@ -1945,17 +2050,9 @@ async function executeTask(task) {
         }
       };
 
-      const timeoutId = setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          chrome.runtime.onMessage.removeListener(handler);
-          // Match the first-DM ten-minute watchdog: background-tab throttling can make
-          // a legitimate multi-step delivery exceed five minutes. This path also settles
-          // an expired delivery as unknown instead of retrying the physical send.
-          dlog("task_timeout", { taskId: task.id, taskType: task.task_type, waitedMs: 600000 }, "warn");
-          reject(new Error("Followup task timed out waiting for content script response"));
-        }
-      }, 600000);
+      // E-05 FIX: same alarm-based watchdog as first_dm path.
+      const alarmName = `task_watchdog_${task.id}`;
+      chrome.alarms.create(alarmName, { when: Date.now() + 600000 });
 
       chrome.runtime.onMessage.addListener(handler);
 
@@ -1966,7 +2063,7 @@ async function executeTask(task) {
             if (!resolved) {
               resolved = true;
               chrome.runtime.onMessage.removeListener(handler);
-              clearTimeout(timeoutId);
+              chrome.alarms.clear(alarmName).catch(() => {});
               reject(new Error(res?.error?.error || "Send message failed to start"));
             }
           }
@@ -1974,7 +2071,7 @@ async function executeTask(task) {
           if (!resolved) {
             resolved = true;
             chrome.runtime.onMessage.removeListener(handler);
-            clearTimeout(timeoutId);
+            chrome.alarms.clear(alarmName).catch(() => {});
             reject(err);
           }
         }
@@ -2131,9 +2228,19 @@ async function openTab(type, targetUrl = null) {
     }
 
     if (tab) {
-      // A discarded tab is still the user's pinned tab. Wake it and let the
-      // normal ping/reload path below verify the content script; never create
-      // a duplicate pinned tab merely because Chrome unloaded its renderer.
+      // E-02 FIX: verify the tab is still on instagram.com before reusing.
+      // Content scripts only inject on *://*.instagram.com/* — pings to any
+      // other domain (skool.com, calendar.google.com, app.dmdroid.app, etc.)
+      // will always fail, causing cs_unresponsive_reload storms against a
+      // tab we can never fix. Do NOT close the user's tab — just forget it
+      // and let the create-path below open a fresh pinned IG tab instead.
+      if (tab.url && !tab.url.includes("instagram.com")) {
+        dlog("tab_url_invalid_replaced", { tabType: type, tabId: tab.id, currentUrl: tab.url }, "warn");
+        debugLog(`[E-02] Tab ${tab.id} is not on instagram.com (${tab.url}) — forgetting it and creating a fresh pinned IG tab.`);
+        state[stateKey] = null;
+        await chrome.storage.local.remove(stateKey);
+        // fall through to the create-tab path (tab is nulled below)
+      } else {
       if (tab.discarded) {
         dlog("tab_discarded_recovered", { tabType: type, tabId: tab.id, currentUrl: tab.url || null }, "warn");
         try {
@@ -2155,26 +2262,27 @@ async function openTab(type, targetUrl = null) {
         }
       }
 
-      // For the additional tab with no explicit target, force-navigate to the DM
-      // inbox so we never reuse a stale thread page from a previous task. The
-      // content script then opens the correct thread live by username.
-      const effectiveUrl = targetUrl || (type === 'additional' ? "https://www.instagram.com/direct/inbox/" : null);
-      debugLog(`Reusing existing ${type} tab ${tab.id}`);
-      dlog("tab_reused", { tabType: type, tabId: tab.id, currentUrl: tab.url || null, wasDiscarded: Boolean(tab.discarded) });
-      dlog("tab_reuse", { tabType: type, tabId: tab.id, currentUrl: tab.url || null });
-      if (effectiveUrl && tab.url !== effectiveUrl) {
-        debugLog(`Navigating ${type} tab to target URL: ${effectiveUrl}`);
-        dlog("tab_navigate", { tabType: type, tabId: tab.id, url: effectiveUrl }, "warn");
-        await chrome.tabs.update(tab.id, { url: effectiveUrl });
-        for (let i = 0; i < 25; i++) {
-          try {
-            const t = await chrome.tabs.get(tab.id);
-            if (t.status === "complete") break;
-          } catch (e) { break; }
-          await sleep(400);
+        // For the additional tab with no explicit target, force-navigate to the DM
+        // inbox so we never reuse a stale thread page from a previous task. The
+        // content script then opens the correct thread live by username.
+        const effectiveUrl = targetUrl || (type === 'additional' ? "https://www.instagram.com/direct/inbox/" : null);
+        debugLog(`Reusing existing ${type} tab ${tab.id}`);
+        dlog("tab_reused", { tabType: type, tabId: tab.id, currentUrl: tab.url || null, wasDiscarded: Boolean(tab.discarded) });
+        dlog("tab_reuse", { tabType: type, tabId: tab.id, currentUrl: tab.url || null });
+        if (effectiveUrl && tab.url !== effectiveUrl) {
+          debugLog(`Navigating ${type} tab to target URL: ${effectiveUrl}`);
+          dlog("tab_navigate", { tabType: type, tabId: tab.id, url: effectiveUrl }, "warn");
+          await chrome.tabs.update(tab.id, { url: effectiveUrl });
+          for (let i = 0; i < 25; i++) {
+            try {
+              const t = await chrome.tabs.get(tab.id);
+              if (t.status === "complete") break;
+            } catch (e) { break; }
+            await sleep(400);
+          }
         }
-      }
-      return tab.id;
+        return tab.id;
+      } // end of instagram.com check
     }
   }
 
@@ -2258,6 +2366,16 @@ async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) 
 
   if (!pingOk) {
     dlog("cs_dead_after_reloads", { taskType, tabId }, "error");
+    // E-02 FIX: null the stored tab state so the NEXT openTab call creates a
+    // fresh pinned IG tab instead of repeatedly failing against this dead tab.
+    const deadTab = await chrome.tabs.get(tabId).catch(() => null);
+    if (deadTab && (!deadTab.url || !deadTab.url.includes("instagram.com"))) {
+      // Tab wandered off IG entirely — forget it. The user's tab stays open.
+      const deadKey = tabId === state.mainTabId ? 'mainTabId' : 'additionalTabId';
+      state[deadKey] = null;
+      await chrome.storage.local.remove(deadKey).catch(() => {});
+      dlog("tab_url_invalid_nulled", { tabType, tabId, url: deadTab.url || null }, "warn");
+    }
     const errObj = new Error("Content script still not responding after tab reloads");
     errObj.unreachableType = "instagram_reload_error";
     throw errObj;
@@ -2594,6 +2712,35 @@ chrome.tabs.onRemoved.addListener(tabId => {
   if (state.additionalTabId === tabId) {
     state.additionalTabId = null;
     chrome.storage.local.remove('additionalTabId').catch(() => null);
+  }
+});
+
+// E-05 FIX: alarm-based task watchdog listener.
+// Handles task_watchdog_{taskId} alarms created by executeTask.
+// Fires when the worker revives after suspension — timing is reliable
+// because alarms persist through suspension (unlike setTimeout).
+// CRITICAL: keeps delivery_unknown classification (invariant ∖1).
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (!alarm.name.startsWith("task_watchdog_")) return;
+  const taskId = alarm.name.slice("task_watchdog_".length);
+  try {
+    // Only settle if the task is still processing (not already completed/failed).
+    const rows = await supabaseReq(`dm_tasks?id=eq.${taskId}&select=id,status,task_type`, "GET").catch(() => []);
+    if (!rows || !rows.length || rows[0].status !== "processing") return;
+    const taskType = rows[0].task_type || "unknown";
+    dlog("task_timeout", { taskId, taskType, waitedMs: 600000 }, "warn");
+    // delivery_unknown: never auto-retry a physical send (duplicate DM prevention).
+    await supabaseReq(`dm_tasks?id=eq.${taskId}`, "PATCH", {
+      status: "failed",
+      error_reason: `delivery_unknown: Task timed out waiting for content script response`
+    }).catch(() => {});
+    dlog("task_delivery_unknown", { taskId, taskType, source: "alarm_watchdog" }, "warn");
+    debugLog(`[Safety] Alarm watchdog: task ${taskId} timed out — settled as delivery_unknown.`);
+    // Release the processing lock so the next poll can claim a new task.
+    state.isProcessing = false;
+    await chrome.storage.local.remove('inFlightTaskId').catch(() => {});
+  } catch (e) {
+    debugLog(`[Alarm Watchdog] Error processing alarm for task ${taskId}: ${e.message}`);
   }
 });
 
