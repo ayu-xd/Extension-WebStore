@@ -1787,9 +1787,21 @@ async function pollTasks() {
             // positively resolved the account, so the search index is what is
             // wrong, and the contact stays claimable by a later campaign instead
             // of being discarded on the strength of a stale index.
-            await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
-              status: "unreachable"
-            });
+            // The park is best-effort. contacts.status is CHECK-constrained
+            // server-side and the checked-in schema dump does not list
+            // 'unreachable' among the allowed values, so this PATCH can 400 on a
+            // database whose constraint was never widened. Until CHURN-04 the park
+            // was the last statement in this branch, so a rejection cost nothing;
+            // now the retire below is what actually keeps the dead lead out of the
+            // queue, and it must not be skipped because the park was refused.
+            try {
+              await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+                status: "unreachable"
+              });
+            } catch (parkErr) {
+              dlog("contact_park_failed", { contactId: task.contact_id, retryClass, reason: parkErr?.message }, "warn");
+              debugLog(`[Collector] Could not park contact ${task.contact_id} as unreachable: ${parkErr?.message}. Retiring its queued tasks anyway.`);
+            }
 
             // CHURN-04: the park above only stops the *next* generation cycle.
             // api/_scheduler-engine.ts builds candidates from contacts.status, so an
@@ -3157,9 +3169,16 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     const taskType = rows[0].task_type || "unknown";
     dlog("task_timeout", { taskId, taskType, waitedMs: 600000 }, "warn");
     // delivery_unknown: never auto-retry a physical send (duplicate DM prevention).
+    // CHURN-02 (second writer): this is the twin of the pollTasks delivery_unknown
+    // branch and lands in the same customer-facing error_reason panel, so it gets
+    // the same plain-English treatment. The wording differs from that one on
+    // purpose: there we know Send was clicked, here the content script went silent
+    // partway through and we cannot claim that much. The `delivery_unknown: `
+    // prefix is load-bearing either way — settleLateVerifiedDelivery matches
+    // error_reason=like.delivery_unknown* to flip the row back to completed.
     await supabaseReq(`dm_tasks?id=eq.${taskId}`, "PATCH", {
       status: "failed",
-      error_reason: `delivery_unknown: Task timed out waiting for content script response`
+      error_reason: `delivery_unknown: Instagram stopped responding partway through this send, so we can't tell whether the message went out. We won't retry it, so this lead can't receive the same DM twice — if it did land, this turns back into a completed send on its own.`
     }).catch(() => {});
     dlog("task_delivery_unknown", { taskId, taskType, source: "alarm_watchdog" }, "warn");
     debugLog(`[Safety] Alarm watchdog: task ${taskId} timed out — settled as delivery_unknown.`);
