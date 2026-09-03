@@ -12,6 +12,11 @@ let state = {
   stats: { completed: 0, failed: 0 },
   isProcessing: false,
   processingLockAcquiredAt: 0,
+  // F-LOCK-01: taskId -> settle(err) for the currently pending executeTask promise.
+  // The alarm watchdog used to poke state.isProcessing directly while that promise
+  // was still pending, so two pollTasks bodies ended up writing one boolean. It now
+  // rejects the promise through this registry and lets pollTasks unwind normally.
+  taskSettlers: {},
   mainTabId: null,
   additionalTabId: null,
   lastTaskCompletedAt: 0,
@@ -127,10 +132,14 @@ async function syncStatsFromDatabase() {
   if (!state.browserId) return state.stats;
 
   try {
-    const rows = await supabaseReq(`dm_tasks?select=id,status&browser_instance_id=eq.${state.browserId}&status=in.(completed,failed)`);
+    // CHURN-05: exclude parked-unreachable rows from the popup's failure count,
+    // exactly as the web dashboard does (lib/scheduler.ts splits failed vs
+    // unreachable on this column). A lead who no longer exists is attrition, not
+    // a failed send, and it must not read as one in either surface.
+    const rows = await supabaseReq(`dm_tasks?select=id,status,unreachable_type&browser_instance_id=eq.${state.browserId}&status=in.(completed,failed)`);
     const stats = (rows || []).reduce((acc, row) => {
       if (row.status === 'completed') acc.completed += 1;
-      if (row.status === 'failed') acc.failed += 1;
+      if (row.status === 'failed' && !row.unreachable_type) acc.failed += 1;
       return acc;
     }, { completed: 0, failed: 0 });
 
@@ -761,13 +770,19 @@ async function pollUniboxReplies() {
 
   try {
     // 0. Expire replies stranded by an offline browser (>7 days old)
+    // CHURN-01: "skipped", not "failed". This is environmental attrition, not a
+    // send error — the user's browser was simply off. The dashboard's failed
+    // bucket (lib/scheduler.ts getTodayStats) counts status === "failed" only,
+    // so "skipped" keeps it out of "Needs attention" while the reason string
+    // still explains it on the task row. Mirrors what the server scheduler
+    // already does for stalled follow-ups (_scheduler-engine.ts:640).
     const cutoff = new Date(Date.now() - 7 * 864e5).toISOString();
     const stale = await supabaseReq(
       `dm_tasks?select=id&task_type=eq.unibox_reply&browser_instance_id=eq.${state.browserId}&status=eq.pending&created_at=lt.${cutoff}`
     );
     if (stale?.length) {
       const ids = stale.map(t => t.id).join(",");
-      await supabaseReq(`dm_tasks?id=in.(${ids})`, "PATCH", { status: "failed", error_reason: "expired_unsent" });
+      await supabaseReq(`dm_tasks?id=in.(${ids})`, "PATCH", { status: "skipped", error_reason: "Not sent — your browser was offline for over 7 days, so this reply expired." });
       await supabaseReq(`ig_messages?dm_task_id=in.(${ids})&send_status=eq.queued`, "PATCH", { send_status: "failed", send_error: "Couldn't deliver — your browser was offline too long." });
       debugLog(`[Unibox] expired ${stale.length} stale reply task(s).`);
     }
@@ -796,9 +811,11 @@ async function pollUniboxReplies() {
 
       // resolve lead handle from contact relation
       let targetUsername = null;
+      let targetFullName = null;
       if (rt.contact_id) {
-        const ct = await supabaseReq(`contacts?select=username&id=eq.${rt.contact_id}`);
+        const ct = await supabaseReq(`contacts?select=username,full_name&id=eq.${rt.contact_id}`);
         targetUsername = ct?.[0]?.username || null;
+        targetFullName = usableFullName(ct?.[0]);
       }
       if (!targetUsername) throw Object.assign(new Error("Lead handle missing for queued reply"), { permanent: true });
       if (!rt.thread_id) throw Object.assign(new Error("No thread id on queued reply"), { permanent: true });
@@ -811,7 +828,7 @@ async function pollUniboxReplies() {
         "additional",
         "sendMessageFromDialog",
         {
-          target: { username: targetUsername },
+          target: { username: targetUsername, fullName: targetFullName },
           message: { text: rt.message_text },
           taskId: rt.id,
           skipMessageExistsCheck: true
@@ -1181,6 +1198,43 @@ async function cancelPendingFollowups(contactId, reason) {
     return count;
   } catch (err) {
     debugLog(`[Collector] Error cancelling follow-ups for contact ${contactId}: ${err.message}`);
+    return 0;
+  }
+}
+
+// CHURN-04: retire every still-pending task for a contact we just parked as
+// unreachable.
+//
+// Why this is needed at all: parking sets contacts.status = 'unreachable', and
+// api/_scheduler-engine.ts only ever builds candidates from
+//   new DMs   -> status IN ('not_started','followed') AND dmed_at IS NULL
+//   followups -> status = 'dmed' AND NOT replied
+// so the park does correctly stop *future* generation for that contact. What it
+// cannot do is reach backwards: rows the scheduler already wrote as 'pending' on
+// an earlier cycle survive the park and get claimed on a later poll, so a handle
+// we have already proven dead comes back around and fails a second time. That is
+// the repeat-failure the user sees in the dashboard.
+//
+// Unlike cancelPendingFollowups this is deliberately NOT scoped by
+// browser_instance_id: unreachable is a property of the lead, not of the account
+// that discovered it, and the park it accompanies is user-wide too. RLS keeps the
+// blast radius inside the owner's own rows. 'processing' is left alone so we never
+// yank a task out from under an in-flight send.
+async function retirePendingTasksForContact(contactId, reason) {
+  if (!contactId) return 0;
+  try {
+    const retired = await supabaseReq(
+      `dm_tasks?contact_id=eq.${contactId}&status=eq.pending`,
+      "PATCH",
+      { status: "skipped", error_reason: reason }
+    );
+    const count = Array.isArray(retired) ? retired.length : 0;
+    if (count > 0) {
+      debugLog(`[Collector] Retired ${count} queued task(s) for parked contact ${contactId}.`);
+    }
+    return count;
+  } catch (err) {
+    debugLog(`[Collector] Error retiring queued tasks for contact ${contactId}: ${err.message}`);
     return 0;
   }
 }
@@ -1607,10 +1661,47 @@ async function pollTasks() {
         retryClass,
         message: String(err.message || err).slice(0, 300)
       }, "error");
+
+      // F-BUSY-02: ColdDMs' teardown ladder, ported from its background.js:6214, and
+      // deliberately hoisted ABOVE the branch chain so no failure class can slip past
+      // it. The old code only navigated the main tab to the inbox, and only for five
+      // dialog classes — every other failure left the content script alive with its
+      // in-memory isBusy possibly still set, which is what the next task collided
+      // with. Upstream destroys the tab on EVERY error except user_is_unreachable,
+      // because a destroyed content script cannot stay busy.
+      //   user_is_unreachable    -> leave the tab alone (expected outcome, tab is fine)
+      //   instagram_reload_error -> reload up to twice, then close (upstream's cap)
+      //   anything else          -> close; next openTab creates a fresh pinned tab
+      if (retryClass === "user_is_unreachable") {
+        // Upstream's single exemption: nothing about the tab is suspect here.
+      } else if (retryClass === "instagram_reload_error") {
+        const rc = Number((await chrome.storage.local.get('reloadCounter')).reloadCounter || 0);
+        let reloaded = false;
+        if (rc < 2 && state.mainTabId) {
+          reloaded = await chrome.tabs.reload(state.mainTabId, { bypassCache: true })
+            .then(() => true).catch(() => false);
+        }
+        if (reloaded) {
+          await chrome.storage.local.set({ reloadCounter: rc + 1 });
+          dlog("tab_reloaded_after_failure", { tabId: state.mainTabId, retryClass, reloadCounter: rc + 1 }, "warn");
+        } else {
+          await closeMainTab(`instagram_reload_error after ${rc} reload attempts`);
+          await chrome.storage.local.set({ reloadCounter: 0 });
+        }
+      } else {
+        await closeMainTab(retryClass || "unclassified task failure");
+      }
+
       if (isDeliveryUnknown) {
         await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
           status: "failed",
-          error_reason: `delivery_unknown: ${String(err.message || err).slice(0, 240)}`
+          // CHURN-02: the `delivery_unknown:` prefix is load-bearing and must stay
+          // byte-for-byte — settleLateVerifiedDelivery() finds these rows with
+          // error_reason=like.delivery_unknown* and flips them to completed once the
+          // send is verified, and rows already in the DB carry the same prefix. Only
+          // the tail is now human-readable. (The web app should strip the prefix
+          // before display; until it does, the sentence still reads correctly after it.)
+          error_reason: "delivery_unknown: We clicked Send but Instagram never confirmed the message went out. We won't retry it, so this lead can't receive the same DM twice — if it did land, this turns back into a completed send on its own."
         });
         state.stats.failed++;
         debugLog(`[Safety] Task ${task.id} reached an unknown delivery state; it will not be auto-retried.`);
@@ -1635,48 +1726,83 @@ async function pollTasks() {
 
         const currentRetries = Number(task.retry_count || 0);
 
-        // E-04 FIX: for user_click_error retries, navigate the main tab to a
-        // fresh inbox page before scheduling the retry. The same degraded React
-        // fiber state causes deterministic failure if the tab is reused as-is.
-        if (retryClass === "user_click_error" && state.mainTabId && currentRetries < 3) {
-          try {
-            await chrome.tabs.update(state.mainTabId, { url: "https://www.instagram.com/direct/inbox/" });
-            dlog("tab_freshened_for_retry", { tabId: state.mainTabId, retryClass }, "warn");
-            debugLog(`[E-04] Freshening main tab for user_click_error retry.`);
-          } catch (e) { /* non-fatal — tab may be gone; next openTab call will recover */ }
-        }
+        // P7: per-class retry ceiling. Default stays 3. The two search_missing_*
+        // classes get exactly 1, which is what "if IG's DM search cannot find the
+        // lead, reload the tab and try once more, then stop" compiles down to:
+        // the F-BUSY-02 teardown ladder above already closes the main tab on these
+        // classes, so the retry claim opens a fresh one. Capping the count IS the
+        // reload. A dead handle used to cost 4 attempts and ~7.5 minutes; it now
+        // costs 2 and ~4, or 1 when the profile API returns a clean 404 — that
+        // arrives as user_not_found, which is permanent and never retries at all.
+        const RETRY_CEILING = { search_missing_alive: 1, search_missing_unproven: 1 };
+        const maxRetries = RETRY_CEILING[retryClass] ?? 3;
 
-        if (!isPermanentError && currentRetries < 3) {
+        // E-04/P5 note: the old inbox-freshen block that lived here only covered
+        // five dialog classes and only navigated the tab. It is superseded by the
+        // F-BUSY-02 teardown ladder hoisted above the branch chain, which now runs
+        // for every failure class (see the comment there for the upstream rule).
+
+        if (!isPermanentError && currentRetries < maxRetries) {
           const nextRetry = currentRetries + 1;
-          debugLog(`[Retry Engine] ${retryClass ? `[${retryClass}] ` : ""}Transient error on task ${task.id} (${err.message}). Retrying (${nextRetry}/3)...`);
+          debugLog(`[Retry Engine] ${retryClass ? `[${retryClass}] ` : ""}Transient error on task ${task.id} (${err.message}). Retrying (${nextRetry}/${maxRetries})...`);
 
           await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
             status: "pending",
             retry_count: nextRetry,
-            error_reason: `[Attempt ${nextRetry}/3] ${err.message || String(err)}`
+            // CHURN-02: was `[Attempt 1/3] <raw bridge message>`. The raw message is
+            // still captured in the local diagnostics ring (dlog task_failed above),
+            // which is where we debug from; the DB column is what the customer reads.
+            error_reason: failureCopy(retryClass, { willRetry: true, attempt: nextRetry, maxRetries })
           });
 
           const wakeUpAt = Date.now() + 30000;
           await setWake('retry', wakeUpAt);
-          dlog("task_retry_scheduled", { taskId: task.id, attempt: nextRetry, retryClass, backoffMs: 30000 }, "warn");
+          dlog("task_retry_scheduled", { taskId: task.id, attempt: nextRetry, retryClass, backoffMs: 30000, maxRetries }, "warn");
         } else {
+          // CHURN-03: decide the bucket first, because the copy depends on it —
+          // when the class is recorded in unreachable_type, Actions.tsx already
+          // prints it as its own "Type:" line and the sentence stays clean.
+          const recordedType = unreachableTypeFor(err, retryClass);
           await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
             status: "failed",
-            error_reason: currentRetries >= 3
-              ? `Failed after 3 retries. Last error: ${err.message || String(err)}`
-              : (err.message || String(err)),
-            unreachable_type: err.unreachableType || null
+            error_reason: failureCopy(retryClass, {
+              attempt: currentRetries + 1,
+              maxRetries,
+              exhausted: currentRetries >= maxRetries,
+              typeRecorded: !!recordedType
+            }),
+            unreachable_type: recordedType
           });
 
           if (retryClass === "rate_limited_error") {
             debugLog("[Pacing] Rate limit error detected! Pausing engine to prevent ban.");
             await chrome.storage.local.set({ enginePaused: true });
-          } else if ((err.unreachableType || retryClass === "user_not_found") && task.contact_id) {
+          } else if ((err.unreachableType || retryClass === "user_not_found" || retryClass === "search_missing_unproven") && task.contact_id) {
             // user_not_found included (F11): a 404'd handle is dead forever —
             // park the contact so future campaigns never claim it again.
+            // search_missing_unproven added (P7): IG's own DM search came back
+            // empty on two separate fresh tabs and the profile API never gave an
+            // answer either time. That is the best evidence obtainable, so park.
+            // search_missing_alive is deliberately NOT in this list: there the API
+            // positively resolved the account, so the search index is what is
+            // wrong, and the contact stays claimable by a later campaign instead
+            // of being discarded on the strength of a stale index.
             await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
               status: "unreachable"
             });
+
+            // CHURN-04: the park above only stops the *next* generation cycle.
+            // api/_scheduler-engine.ts builds candidates from contacts.status, so an
+            // unreachable contact is excluded from both the new-DM and follow-up
+            // candidate sets — but rows it already wrote as 'pending' on an earlier
+            // cycle are untouched by that and get claimed on a later poll, so the
+            // handle we just proved dead comes back around and fails again. Retiring
+            // them here, in the same beat as the park, is what actually keeps a bad
+            // lead out of the queue.
+            await retirePendingTasksForContact(
+              task.contact_id,
+              "Skipped — this lead was set aside because Instagram can't deliver to their account."
+            );
           }
 
           state.stats.failed++;
@@ -1687,6 +1813,11 @@ async function pollTasks() {
       // E-01 Part 2 FIX: always clear the in-flight task ID on both success and
       // error paths so the lock-recovery busy guard doesn't block on a finished task.
       await chrome.storage.local.remove('inFlightTaskId').catch(() => {});
+      // F-LOCK-01: drop the settler on every path. This is the only place that is
+      // guaranteed to run once per claimed task, so it is the only safe place to
+      // unregister — leaving it behind would let a later watchdog reject a promise
+      // that has already settled.
+      delete state.taskSettlers[task.id];
     }
 
     await chrome.storage.local.set({ stats: state.stats });
@@ -1704,6 +1835,157 @@ async function pollTasks() {
   } finally {
     state.isProcessing = false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Lead name resolution (server-side first)
+// ---------------------------------------------------------------------------
+
+// N1: return contacts.full_name only when it holds a REAL name, never a
+// placeholder. Importers and the unibox sync both write the username into
+// full_name when they have nothing better, and some rows carry "@handle" or a
+// blank string. Handing any of those to the content script as a name would make
+// it skip the live Instagram lookup and greet the lead with their own handle.
+// Mirrors the isPlaceholder test the full_name write-back already applies.
+function usableFullName(contact) {
+  const full = String(contact?.full_name ?? "").trim();
+  if (!full) return null;
+  const handle = String(contact?.username ?? "").replace(/^@+/, "").trim().toLowerCase();
+  const bare = full.replace(/^@+/, "").trim().toLowerCase();
+  if (handle && bare === handle) return null;
+  return full;
+}
+
+// CHURN-06: persist a live-resolved real name so later sends take the fast
+// server-side path (usableFullName -> payload target.fullName) instead of
+// re-scraping through getUserByUsername, which is the flakiest call on the send
+// path. Only ever overwrites a username-placeholder — never a real name and never
+// a manual override the user typed.
+//
+// Shared deliberately: this used to be inline in the first_dm success handler
+// only, so a lead first reached by a follow-up kept re-scraping forever even
+// though content.js had already emitted resolvedFullName on that route too. One
+// copy called from both handlers is what stops the two routes drifting again.
+async function persistResolvedFullName(task, resolvedFullName) {
+  if (!resolvedFullName || !task?.contact_id) return false;
+  try {
+    const storedFull = (task.contacts?.full_name || "").trim();
+    const storedUser = (task.contacts?.username || "").replace(/^@/, "").trim().toLowerCase();
+    const isPlaceholder = !storedFull || storedFull.toLowerCase() === storedUser;
+    const newFull = String(resolvedFullName).trim();
+    if (!isPlaceholder || !newFull || newFull.toLowerCase() === storedFull.toLowerCase()) return false;
+    await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", { full_name: newFull });
+    debugLog(`[Name] Persisted live-resolved full_name for ${task.contact_id}: "${newFull}"`);
+    return true;
+  } catch (e) {
+    // Non-fatal: resolution still worked, only the write-back failed.
+    debugLog(`[Name] Write-back skipped for ${task.contact_id}: ${e?.toString()}`);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CHURN-02 / CHURN-03 — customer-facing task failure labelling
+//
+// error_reason is read by paying users, not by us: the web app prints it
+// verbatim inside a red "Error" panel (src/pages/Actions.tsx) and in the support
+// view (Admin.tsx). A raw bridge message ("user_click_error: no result matched")
+// therefore reads as a product defect and is exactly what makes people cancel,
+// even when what actually happened was a dead lead.
+//
+// IMPORTANT: the keys below are NOT new vocabulary. Every one is a type string
+// that already exists in this codebase. The 12 UNREACHABLE_*/REACHABLE_* keys
+// are Instagram's own reachability enum, inherited verbatim from upstream
+// ColdDMs (identical names and indices, assets/content.js:936). The remaining
+// keys are the ExtensionError `type` values that dom.js and content.js already
+// throw. Nothing here invents, renames or aliases a type — this is purely a
+// display layer over the existing ones, and any class that is missing from the
+// map falls through to the generic copy rather than leaking a raw message.
+const TASK_FAILURE_COPY = {
+  // --- Instagram reachability enum (upstream ColdDMs vocabulary, verbatim) ---
+  UNREACHABLE_USER_TYPE: "Instagram doesn't allow message requests to this kind of account. Nothing was sent.",
+  UNREACHABLE_ADULT_TYPE: "Instagram blocked the message request to this account. Nothing was sent.",
+  UNREACHABLE_INVITE_BLOCK: "Instagram wouldn't let a message request reach this account. Nothing was sent.",
+  UNREACHABLE_MR_LIMIT_BLOCK: "Instagram is refusing new message requests on this route right now. Nothing was sent.",
+  UNREACHABLE_RS_UPSELL_ELIGIBLE: "Instagram won't deliver a message request to this account. Nothing was sent.",
+  UNREACHABLE_INTEROP_THIRD_PARTY_USER: "This is a Messenger or WhatsApp account, so it can't receive Instagram DMs. Nothing was sent.",
+  UNREACHABLE_INTEROP_USER_OPT_OUT: "This account has opted out of receiving messages from Instagram. Nothing was sent.",
+  UNREACHABLE_INTEROP_THIRD_PARTY_APP_NOT_SUPPORTED: "This account is on an app that can't receive Instagram DMs. Nothing was sent.",
+  UNREACHABLE_INTEROP_USER_REMOVED_THIRD_PARTY_APP: "This account removed the app it used to receive messages on. Nothing was sent.",
+  UNREACHABLE_NULL_INTEROP_USER: "Instagram can no longer find a messaging inbox for this account. Nothing was sent.",
+  // --- ExtensionError types thrown by content.js / dom.js ---
+  user_not_found: "This Instagram handle no longer exists — the account was deleted, renamed or deactivated. Nothing was sent.",
+  user_is_unreachable: "Instagram won't deliver a message request to this account. Nothing was sent.",
+  banned_error: "Instagram has restricted your account's messaging, so we stopped to keep it safe. Nothing was sent — try again once the restriction lifts.",
+  rate_limited_error: "Instagram rate-limited your account, so we stopped to keep it safe. Nothing was sent — this lead stays in the queue.",
+  search_missing_alive: "This account exists but didn't come up in Instagram's DM search, so we couldn't open the chat. Nothing was sent — the lead stays in your queue.",
+  search_missing_unproven: "This handle didn't come up in Instagram's DM search and we couldn't confirm the account still exists. Nothing was sent.",
+  thread_not_found: "Instagram didn't return the conversation for this lead, so we couldn't read or continue it. Nothing was sent.",
+  thread_busy: "Another send was already in progress in this conversation, so we skipped this one to avoid a duplicate DM.",
+  composer_empty_error: "Instagram cleared the message box before we could send, so nothing went out.",
+  send_unconfirmed_error: "We couldn't confirm Instagram accepted the message, so we stopped instead of risking a duplicate.",
+  user_search_error: "Instagram's DM search didn't respond, so we couldn't open the chat. Nothing was sent.",
+  user_click_error: "Instagram's DM search returned results but wouldn't open this lead's chat. Nothing was sent.",
+  open_search_popup_error: "Instagram's new-message window wouldn't open, so nothing was sent.",
+  open_direct_page_error: "Instagram's inbox wouldn't load, so nothing was sent.",
+  react_bridge_timeout: "Instagram's page stopped responding mid-send, so we stopped. Nothing was sent.",
+  instagram_reload_error: "Instagram's tab had to be reloaded mid-send, so we stopped. Nothing was sent.",
+  additional_tab_error: "The background Instagram tab we send from wouldn't start, so nothing was sent.",
+  collect_messages_error: "We couldn't read this conversation's messages from Instagram."
+};
+const GENERIC_RETRY_COPY = "Instagram didn't complete this send.";
+const GENERIC_GIVEUP_COPY = "Instagram didn't complete this send. Nothing was sent — the lead stays in your queue.";
+
+// Turn a retryClass into the sentence the account owner reads. `typeRecorded`
+// says whether the class is also being written to dm_tasks.unreachable_type;
+// Actions.tsx renders that column as its own "Type:" line, so the reference code
+// is appended only when this string is support's only breadcrumb.
+function failureCopy(retryClass, { willRetry = false, attempt = 0, maxRetries = 0, exhausted = false, typeRecorded = false } = {}) {
+  const mapped = TASK_FAILURE_COPY[retryClass] || null;
+  if (willRetry) {
+    return `${mapped || GENERIC_RETRY_COPY} Retrying automatically (attempt ${attempt} of ${maxRetries}).`;
+  }
+  const base = mapped || GENERIC_GIVEUP_COPY;
+  const tried = exhausted && attempt > 1 ? ` Tried ${attempt} times.` : "";
+  return retryClass && !typeRecorded ? `${base}${tried} [${retryClass}]` : `${base}${tried}`;
+}
+
+// CHURN-03: which failures belong in dm_tasks.unreachable_type.
+//
+// This is the column the dashboard buckets on: lib/scheduler.ts counts a failed
+// task as a real error only when unreachable_type IS NULL, and routes the rest to
+// the quiet "filtered by Instagram" chip. Before this change the write was
+// `err.unreachableType || null`, which is only ever set when Instagram handed us
+// a thread with a reachability status — so a handle that no longer exists
+// (user_not_found, which has no thread and therefore no status) landed in the red
+// "Needs attention" bucket and read as our bug. That is the mislabelling the
+// dashboard complaint was about.
+//
+// Every value that can be written here is an existing type string — Instagram's
+// reachability enum via err.unreachableType, or one of the four proven-verdict
+// ExtensionError types below. No new vocabulary is coined.
+//
+// search_missing_alive and search_missing_unproven are deliberately NOT here.
+// "alive" means the API positively resolved the account, so calling it
+// unreachable would be a lie; "unproven" means the API couldn't tell us either
+// way, and quietly hiding a failure we can't prove is how a dashboard stops being
+// trustworthy. Both keep their honest red row.
+//
+// Only two entries, and both are types something actually throws:
+// content.js:800/:1563 throw user_not_found, content.js:2214 and the two dialog
+// paths throw user_is_unreachable. The isPermanentError list further down also
+// names cannot_message_user and account_disabled, but nothing in this extension or
+// in upstream ColdDMs ever emits those two, so mapping them here would be
+// inventing a vocabulary we don't have — if a future path does throw them they
+// fall through to the generic copy and the red bucket, which is the safe default.
+const PROVEN_UNREACHABLE_CLASSES = new Set([
+  "user_not_found",
+  "user_is_unreachable"
+]);
+
+function unreachableTypeFor(err, retryClass) {
+  if (err?.unreachableType) return err.unreachableType;
+  return PROVEN_UNREACHABLE_CLASSES.has(retryClass) ? retryClass : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1758,7 +2040,7 @@ async function executeTask(task) {
     }
 
     const payload = {
-      target: { username: targetUsername },
+      target: { username: targetUsername, fullName: usableFullName(task.contacts) },
       message: { text: finalMessageText },
       taskId: task.id,
       hasImage,
@@ -1826,28 +2108,10 @@ async function executeTask(task) {
                   }
                 }
                 // Write back a live-resolved real name so follow-ups use the fast
-                // server-side path instead of re-scraping every time. Only when:
-                //  - the extension actually scraped a name this send (resolvedFullName),
-                //  - and the stored full_name is still a username-placeholder
-                //    (empty or equal to the username) — never clobber a real name
-                //    or a manual override the user set.
-                if (data.resolvedFullName && task.contact_id) {
-                  try {
-                    const storedFull = (task.contacts?.full_name || "").trim();
-                    const storedUser = (task.contacts?.username || "").replace(/^@/, "").trim().toLowerCase();
-                    const isPlaceholder = !storedFull || storedFull.trim().toLowerCase() === storedUser;
-                    const newFull = String(data.resolvedFullName).trim();
-                    if (isPlaceholder && newFull && newFull.toLowerCase() !== storedFull.toLowerCase()) {
-                      await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
-                        full_name: newFull
-                      });
-                      debugLog(`[Name] Persisted live-resolved full_name for ${task.contact_id}: "${newFull}"`);
-                    }
-                  } catch (e) {
-                    // Non-fatal: resolution still worked, only the write-back failed.
-                    debugLog(`[Name] Write-back skipped for ${task.contact_id}: ${e?.toString()}`);
-                  }
-                }
+                // server-side path instead of re-scraping every time. See
+                // persistResolvedFullName — the placeholder-only guard lives there,
+                // and the follow-up success handler calls the same helper.
+                await persistResolvedFullName(task, data.resolvedFullName);
                 if (data.response === true && task.contact_id) {
                   debugLog(`[Guard] Lead replied — skipping send for task ${task.id}, cancelling remaining follow-ups.`);
                   await cancelPendingFollowups(task.contact_id, "lead_replied");
@@ -1909,6 +2173,19 @@ async function executeTask(task) {
 
       chrome.runtime.onMessage.addListener(handler);
 
+      // F-LOCK-01: give the alarm watchdog a way to settle THIS promise. Without it
+      // the watchdog force-released the poller's lock while this promise was still
+      // pending, so the abandoned pollTasks body later ran its own finally and
+      // cleared a lock that by then belonged to a newer task — a third task then got
+      // claimed into a still-busy tab. It also leaked this listener forever.
+      state.taskSettlers[task.id] = (err) => {
+        if (resolved) return;
+        resolved = true;
+        chrome.runtime.onMessage.removeListener(handler);
+        chrome.alarms.clear(alarmName).catch(() => {});
+        reject(err);
+      };
+
       (async () => {
         try {
           const res = await sendTaskToContent("main", "sendMessage", payload);
@@ -1954,7 +2231,7 @@ async function executeTask(task) {
     debugLog(`[Followup] Routing via main-tab live-id scrape -> additional-tab thread open for ${targetUsername}`);
 
     const payload = {
-      target: { username: targetUsername },
+      target: { username: targetUsername, fullName: usableFullName(task.contacts) },
       message: { text: task.message_text },
       taskId: task.id,
       skipMessageExistsCheck: false,
@@ -1999,6 +2276,12 @@ async function executeTask(task) {
                     await caoUpsert(task.contact_id, { assigned_thread_id: data.threadId });
                   }
                 }
+                // CHURN-06: same name write-back as the first_dm path. content.js
+                // already emitted resolvedFullName on this route (the dialog send in
+                // the additional tab resolves the name when the template still has a
+                // {{placeholder}}); this handler simply never read it, so a lead whose
+                // first touch was a follow-up re-scraped their name on every send.
+                await persistResolvedFullName(task, data.resolvedFullName);
                 if (data.response === true && task.contact_id) {
                   debugLog(`[Guard] Lead replied — skipping send for task ${task.id}, cancelling remaining follow-ups.`);
                   await cancelPendingFollowups(task.contact_id, "lead_replied");
@@ -2055,6 +2338,17 @@ async function executeTask(task) {
       chrome.alarms.create(alarmName, { when: Date.now() + 600000 });
 
       chrome.runtime.onMessage.addListener(handler);
+
+      // F-LOCK-01: same settler registration as the first_dm path above. Registering
+      // it in only one of the two branches is exactly the hidden-route bug class that
+      // made the earlier username-lookup fix look done while half the calls bypassed it.
+      state.taskSettlers[task.id] = (err) => {
+        if (resolved) return;
+        resolved = true;
+        chrome.runtime.onMessage.removeListener(handler);
+        chrome.alarms.clear(alarmName).catch(() => {});
+        reject(err);
+      };
 
       (async () => {
         try {
@@ -2202,6 +2496,60 @@ function randUrl() {
   return urls[Math.floor(Math.random() * urls.length)];
 }
 
+// F-LOAD-01: ColdDMs records the HTTP response of every Instagram main_frame load
+// (its background.js:6014 populating the `z` map) so openTab can tell a real page
+// from an error page. Chrome reports status:"complete" for a 429 rate-limit wall or
+// a 500 exactly as happily as for a good load, so without this we cannot tell
+// "Instagram said no" from "this lead does not exist" — which is how live handles
+// ended up parked as unreachable. In-memory only, like upstream: a suspended service
+// worker loses the map, and a missing record always FAILS OPEN. Registered
+// defensively so the extension still runs if `webRequest` is dropped from the
+// manifest (the URL layer below keeps working without that permission).
+const _mainFrameResponses = {};
+if (chrome.webRequest?.onCompleted?.addListener) {
+  chrome.webRequest.onCompleted.addListener(
+    (d) => {
+      if (d.type !== "main_frame" || d.tabId < 0) return;
+      _mainFrameResponses[d.tabId] = {
+        date: Date.now(),
+        statusCode: Number(d.statusCode) || null,
+        url: d.url || null
+      };
+    },
+    { urls: ["*://*.instagram.com/*"] }
+  );
+}
+
+// F-LOAD-01: URLs that mean "this tab is useless whatever HTTP code came back".
+// Needs only the `tabs` permission we already hold. Trailing slashes on challenge/
+// checkpoint are deliberate — bare "/challenge" would also match a profile such as
+// /challenges_official, and closing a tab over a username would be its own bug.
+const DEAD_END_URL_MARKERS = [
+  "/accounts/login",
+  "/accounts/suspended",
+  "/accounts/disabled",
+  "/challenge/",
+  "/checkpoint/"
+];
+
+// Returns a reason string if this tab's most recent Instagram load was bad, else
+// null. Both layers FAIL OPEN: an unknown state is never treated as bad, because
+// closing a healthy tab on a guess is worse than missing one bad load. Pass
+// startedAt = Infinity to disable the HTTP layer when no navigation was initiated.
+function badTabLoadReason(tabId, startedAt, tabUrl) {
+  const url = String(tabUrl || "");
+  const hit = DEAD_END_URL_MARKERS.find((m) => url.includes(m));
+  if (hit) return `page landed on ${hit} (url=${url.slice(0, 120)})`;
+  const rec = _mainFrameResponses[tabId];
+  // Only trust a response recorded AFTER this load began — upstream's `e < n`
+  // guard at background.js:6584. A stale record describes the previous page.
+  if (!rec || !(startedAt < rec.date) || !rec.statusCode) return null;
+  if (rec.statusCode < 200 || rec.statusCode >= 300) {
+    return `Instagram returned HTTP ${rec.statusCode} for ${String(rec.url || url).slice(0, 120)}`;
+  }
+  return null;
+}
+
 async function openTab(type, targetUrl = null) {
   const stateKey = type === 'main' ? 'mainTabId' : 'additionalTabId';
 
@@ -2269,9 +2617,15 @@ async function openTab(type, targetUrl = null) {
         debugLog(`Reusing existing ${type} tab ${tab.id}`);
         dlog("tab_reused", { tabType: type, tabId: tab.id, currentUrl: tab.url || null, wasDiscarded: Boolean(tab.discarded) });
         dlog("tab_reuse", { tabType: type, tabId: tab.id, currentUrl: tab.url || null });
+        // F-LOAD-01: Infinity disables the HTTP layer when we do NOT navigate, so a
+        // stale response record from an earlier page can never condemn this tab. The
+        // URL layer still runs either way — a tab already parked on the login wall is
+        // useless regardless of when it got there.
+        let navStartedAt = Infinity;
         if (effectiveUrl && tab.url !== effectiveUrl) {
           debugLog(`Navigating ${type} tab to target URL: ${effectiveUrl}`);
           dlog("tab_navigate", { tabType: type, tabId: tab.id, url: effectiveUrl }, "warn");
+          navStartedAt = Date.now();
           await chrome.tabs.update(tab.id, { url: effectiveUrl });
           for (let i = 0; i < 25; i++) {
             try {
@@ -2281,6 +2635,17 @@ async function openTab(type, targetUrl = null) {
             await sleep(400);
           }
         }
+        const reusedTab = await chrome.tabs.get(tab.id).catch(() => null);
+        const reusedBad = badTabLoadReason(tab.id, navStartedAt, reusedTab?.url || tab.url);
+        if (reusedBad) {
+          dlog("tab_bad_load", { tabType: type, tabId: tab.id, reason: reusedBad, phase: "reuse" }, "error");
+          debugLog(`[F-LOAD-01] Reused ${type} tab is not on a usable Instagram page: ${reusedBad}`);
+          if (type === 'main') await closeMainTab(`bad page load: ${reusedBad}`);
+          else await closeAdditionalTab(`bad page load: ${reusedBad}`);
+          const loadErr = new Error(`Instagram page load failed: ${reusedBad}`);
+          loadErr.errorType = "instagram_reload_error";
+          throw loadErr;
+        }
         return tab.id;
       } // end of instagram.com check
     }
@@ -2288,6 +2653,7 @@ async function openTab(type, targetUrl = null) {
 
   debugLog(`Opening pinned Instagram ${type} tab...`);
 
+  const createStartedAt = Date.now();
   const tab = await chrome.tabs.create({
     url: targetUrl || randUrl(),
     active: false,
@@ -2297,6 +2663,12 @@ async function openTab(type, targetUrl = null) {
 
   state[stateKey] = tab.id;
   await chrome.storage.local.set({ [stateKey]: tab.id });
+
+  // F-LOAD-02: reset the reload ladder on a FRESH tab, mirroring upstream's
+  // background.js:6567. We only zeroed it when the ladder itself gave up and closed,
+  // so a tab replaced by any other route (stored tab missing, wandered off IG, dead
+  // after reloads) inherited a stale counter and skipped the cheap reload entirely.
+  if (type === 'main') await chrome.storage.local.set({ reloadCounter: 0 });
 
   debugLog(`Tab opened (${type}): ${tab.id}, waiting for load...`);
   dlog("tab_created", { tabType: type, tabId: tab.id, url: tab.url || targetUrl || "random" });
@@ -2309,8 +2681,56 @@ async function openTab(type, targetUrl = null) {
     await sleep(400);
   }
 
+  // F-LOAD-01: upstream checks the HTTP code here and returns null on a bad load
+  // (background.js:6593). We THROW instead, because upstream's caller checks for
+  // null (:6192) and ours does not — sendTaskToContent would hand null straight to
+  // chrome.tabs.sendMessage. Note errorType, NOT unreachableType: pollTasks parks
+  // the contact as unreachable whenever err.unreachableType is set and retries are
+  // exhausted, and parking a live lead because Instagram had a bad minute is the
+  // exact harm this check exists to prevent.
+  const freshTab = await chrome.tabs.get(tab.id).catch(() => null);
+  const freshBad = badTabLoadReason(tab.id, createStartedAt, freshTab?.url || tab.url);
+  if (freshBad) {
+    dlog("tab_bad_load", { tabType: type, tabId: tab.id, reason: freshBad, phase: "create" }, "error");
+    debugLog(`[F-LOAD-01] Fresh ${type} tab did not load a usable Instagram page: ${freshBad}`);
+    if (type === 'main') await closeMainTab(`bad page load: ${freshBad}`);
+    else await closeAdditionalTab(`bad page load: ${freshBad}`);
+    const loadErr = new Error(`Instagram page load failed: ${freshBad}`);
+    loadErr.errorType = "instagram_reload_error";
+    throw loadErr;
+  }
+
   debugLog(`Tab ready (${type}).`);
   return tab.id;
+}
+
+// F-BUSY-02: ColdDMs' disposability primitive, ported from its background.js:6680.
+// Nulls the stored id BEFORE removing the tab, so even a failed remove leaves the id
+// forgotten and the next openTab creates a fresh pinned IG tab instead of hammering a
+// corpse. Closing the main tab also closes the additional tab, exactly as upstream
+// does. This is the only reliable way to clear the content script's in-memory isBusy:
+// a lease can be extended, a flag in another world cannot be reached.
+// F-BUSY-02: mirrors upstream's closeAdditionalTab (background.js:6698). Same
+// null-then-remove order as closeMainTab, for the same reason.
+async function closeAdditionalTab(reason) {
+  if (!state.additionalTabId) return;
+  const tabId = state.additionalTabId;
+  state.additionalTabId = null;
+  await chrome.storage.local.remove('additionalTabId').catch(() => {});
+  await chrome.tabs.remove(tabId).catch(() => {});
+  dlog("additional_tab_closed", { tabId, reason: reason || null }, "warn");
+}
+
+async function closeMainTab(reason) {
+  // Upstream's closeTab closes the additional tab first (background.js:6681).
+  await closeAdditionalTab(reason);
+  if (!state.mainTabId) return;
+  const tabId = state.mainTabId;
+  state.mainTabId = null;
+  await chrome.storage.local.remove('mainTabId').catch(() => {});
+  await chrome.tabs.remove(tabId).catch(() => {});
+  dlog("main_tab_closed", { tabId, reason: reason || null }, "warn");
+  debugLog(`[Recovery] Closed main tab (${reason || "unspecified"}). Next task opens a fresh one.`);
 }
 
 async function closeTabs() {
@@ -2377,7 +2797,14 @@ async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) 
       dlog("tab_url_invalid_nulled", { tabType, tabId, url: deadTab.url || null }, "warn");
     }
     const errObj = new Error("Content script still not responding after tab reloads");
-    errObj.unreachableType = "instagram_reload_error";
+    // CHURN-07: was `unreachableType`, which is the exact mistake the F-LOAD-01
+    // comment above warns about — pollTasks parks the contact whenever
+    // err.unreachableType is set, so a dead content script in OUR tab was parking
+    // a perfectly live lead as unreachable. Same class name, correct field: it now
+    // routes as a transient error with the normal 3 retries and never touches the
+    // contact. (Left as unreachableType this would also have retired the lead's
+    // queued tasks once CHURN-04 landed, turning a browser hiccup into lost leads.)
+    errObj.errorType = "instagram_reload_error";
     throw errObj;
   }
 
@@ -2736,9 +3163,36 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     }).catch(() => {});
     dlog("task_delivery_unknown", { taskId, taskType, source: "alarm_watchdog" }, "warn");
     debugLog(`[Safety] Alarm watchdog: task ${taskId} timed out — settled as delivery_unknown.`);
-    // Release the processing lock so the next poll can claim a new task.
-    state.isProcessing = false;
-    await chrome.storage.local.remove('inFlightTaskId').catch(() => {});
+
+    // F-LOCK-01: settle the pending executeTask promise instead of force-releasing
+    // the lock behind pollTasks' back. pollTasks then unwinds through its own
+    // catch — whose classifier already maps this exact message to delivery_unknown
+    // (see isDeliveryUnknown above) — and its own finally, so state.isProcessing
+    // keeps exactly one writer and the message listener is removed rather than
+    // leaked. The row lands on the same values this handler just wrote.
+    const settle = state.taskSettlers[taskId];
+    if (settle) {
+      const timeoutErr = new Error("Task timed out waiting for content script response");
+      timeoutErr.errorType = "content_script_timeout";
+      settle(timeoutErr);
+    } else {
+      // No settler registered: the task already unwound some other way, so there is
+      // nobody to reject. Fall back to the old force-release.
+      state.isProcessing = false;
+      await chrome.storage.local.remove('inFlightTaskId').catch(() => {});
+    }
+
+    // F-BUSY-01/02: the content script is still mid-task with isBusy = true, and an
+    // in-memory flag in another world cannot be cleared by extending a lease — which
+    // is why the next task met a busy tab and requeued, producing the thread_busy
+    // churn. ColdDMs' answer is to DESTROY the content script (its background.js:6214
+    // closes the tab on every error but user_is_unreachable), so close here too rather
+    // than merely reload: a task wedged for 10 minutes may be wedged at the page level,
+    // not just in the script. Safe because the row is already delivery_unknown, so no
+    // send is ever retried because of this. pollTasks' own delivery_unknown branch
+    // returns before the teardown ladder, so this is the only teardown for this path.
+    await closeMainTab(`content script timeout on task ${taskId}`);
+    dlog("cs_reset_after_timeout", { taskId }, "warn");
   } catch (e) {
     debugLog(`[Alarm Watchdog] Error processing alarm for task ${taskId}: ${e.message}`);
   }

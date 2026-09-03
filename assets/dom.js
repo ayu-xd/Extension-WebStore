@@ -80,7 +80,16 @@ class ADBlockDOMConnector extends ADBlockAsyncEventEmitter {
       })
     }, "*")
   }
-  send(r, n = {}) {
+  // F-SEARCH-02: optional per-call deadline. This bridge (dom.js -> ReactDev.js)
+  // had NO timeout of any kind: a task whose response never came back left the
+  // promise unsettled forever, and the only backstop was content.js's own
+  // 240 s ceiling one layer up — which rejects the content-side promise but
+  // cannot cancel the page-world work, so the orphan kept driving Instagram's
+  // search box after it had been declared dead (2026-09-03 logs, 8:56:05 ->
+  // 8:56:07 AM). Default 0 keeps every existing call site byte-identical in
+  // behaviour, including the follower/following scrapes that legitimately run
+  // for minutes; callers opt in where a hang is known to be costly.
+  send(r, n = {}, { timeoutMs = 0 } = {}) {
     return new Promise(async (e, t) => {
       var s = `${Date.now()}_${Math.random()}_` + Math.random();
       this.reservedTasks[s] = [e, t], this.emit({
@@ -90,7 +99,18 @@ class ADBlockDOMConnector extends ADBlockAsyncEventEmitter {
           type: r,
           data: n
         }
-      })
+      });
+      if (timeoutMs > 0) {
+        setTimeout(() => {
+          if (this.reservedTasks[s]) {
+            delete this.reservedTasks[s];
+            t(new ExtensionError({
+              type: "react_bridge_timeout",
+              message: `reactConnector timeout after ${timeoutMs}ms: ${r}`
+            }));
+          }
+        }, timeoutMs);
+      }
     })
   }
   registerTask(e, t) {
@@ -381,7 +401,8 @@ class ADBlockDOM {
   }
   async _getUserInSearchWindow({
     userId: t,
-    username: s
+    username: s,
+    allowSlowFallback: a = !0
   }) {
     var r = await this.domReactConnector.send("findSearchResult", {});
     this.log({ type: "[searchWindow] findSearchResult (live fibers) returned", data: { username: s, resultCount: r?.length ?? 0 } });
@@ -390,11 +411,34 @@ class ADBlockDOM {
         candidate: e
       }) => s ? e.subtext === s : e.igid === t);
       if (e) this.log({ type: "[searchWindow] Matched via live fibers (primary path)", data: { username: s, threadId: e?.candidate?.id ?? null } });
-      if (!e && s) {
+      // F-SEARCH-01: the server_search_results fallback is a FULL ReStore table
+      // read plus a per-field i64 transform of every row (ReactDev.js
+      // _alternativeSearchResultsMapping -> _getDatabase -> ReQL.toArrayAsync),
+      // measured at 10-20 s per call in the 2026-09-03 logs. Both poll loops
+      // below call this function 10x per pass, and the table is not rewritten
+      // between polls, so paying for it on every poll cost ~240 s per pass —
+      // the same figure as content.js's 240 s domConnector ceiling. That tie is
+      // why one attempt reported "domConnector timeout after 240000ms: openUser"
+      // with errorType null while the next three reported user_click_error for
+      // the identical situation, and why one unreachable handle burned ~20 min
+      // across four attempts. The cheap fiber read above still runs on every
+      // poll; the expensive rescue now runs once per pass, on the final poll,
+      // when we are about to give up anyway.
+      if (!e && s && !a) this.log({ type: "[searchWindow] No fiber match — server_search_results fallback deferred to the final poll", data: { username: s } });
+      if (!e && s && a) {
         this.log({ type: "[searchWindow] No fiber match — trying server_search_results fallback (fail-soft)", data: { username: s } });
-        const n = await this.domReactConnector.send("alternativeSearchResultsMapping", {
-          username: s
-        });
+        let n = null;
+        try {
+          // Bounded: this is the one call that demonstrably burns 10-20 s and
+          // the one that left an orphan still polling after content.js had
+          // given up. Fail-soft on timeout, exactly as ReactDev.js already
+          // fails soft when the ReStore table is missing.
+          n = await this.domReactConnector.send("alternativeSearchResultsMapping", {
+            username: s
+          }, { timeoutMs: 45000 });
+        } catch (_e) {
+          this.log({ type: "[searchWindow] server_search_results fallback gave no answer (non-fatal)", data: { username: s, error: String(_e?.message || _e?.error || _e) } });
+        }
         n && (e = r.filter(e => "user" === e.type).find(({
           candidate: e
         }) => String(e.igid) === String(n.resultIgid)));
@@ -410,9 +454,12 @@ class ADBlockDOM {
     skipOpenDialog: r
   }) {
     for (let e = 0; e < 10; e++) {
+      // F-SEARCH-01: cheap fiber read on every poll, expensive ReStore rescue
+      // only on the last one. See _getUserInSearchWindow.
       var n = await this._getUserInSearchWindow({
         userId: t,
-        username: s
+        username: s,
+        allowSlowFallback: 9 === e
       });
       if (n) {
         await this.domReactConnector.send("clickOnUser", {
@@ -441,9 +488,12 @@ class ADBlockDOM {
     username: s
   }) {
     for (let e = 0; e < 10; e++) {
+      // F-SEARCH-01: cheap fiber read on every poll, expensive ReStore rescue
+      // only on the last one. See _getUserInSearchWindow.
       var r = await this._getUserInSearchWindow({
         userId: t,
-        username: s
+        username: s,
+        allowSlowFallback: 9 === e
       });
       if (r) return await this.domReactConnector.send("clickOnUser", {
         userId: r.candidate.igid,
@@ -456,41 +506,58 @@ class ADBlockDOM {
   async _openUser({
     username: e
   }) {
-    if (!await this.domReactConnector.send("clickDialogButton", {})) throw new ExtensionError({
-      type: "open_search_popup_error",
-      message: "Error while opening the popup"
-    });
-    if (await this.sleep(5e3), !await this.domReactConnector.send("enterUsername", {
-        username: e
-      })) throw new ExtensionError({
-      type: "user_search_error",
-      message: "Error while entering username"
-    });
-    if (await this.sleep(5e3), await this._clickOnUserIdDialogButton({
-        username: e
-      })) return !0;
-    if (this.log({
-        type: "User was not found in dialog in first attempt",
-        data: {}
-      }), !await this.domReactConnector.send("enterUsername", {
-        username: "instagra"
-      })) throw new ExtensionError({
-      type: "user_search_error",
-      message: "Error while entering username"
-    });
-    if (await this.sleep(2e3), !await this.domReactConnector.send("enterUsername", {
-        username: e
-      })) throw new ExtensionError({
-      type: "user_search_error",
-      message: "Error while entering username"
-    });
-    if (await this.sleep(5e3), await this._clickOnUserIdDialogButton({
-        username: e
-      })) return !0;
-    throw new ExtensionError({
-      type: "user_click_error",
-      message: "User was not found in popup"
-    })
+    // P2: mirror the finally-close already used by _findUserInDialogWithoutClick.
+    // This function used to throw user_click_error with the search dialog still
+    // open, so a failed attempt poisoned the tab for the next one. Only close on
+    // the failure paths — on success the dialog must stay open, because the
+    // caller's clickChat has already navigated into the thread from it.
+    let _opened = false;
+    try {
+      if (!await this.domReactConnector.send("clickDialogButton", {})) throw new ExtensionError({
+        type: "open_search_popup_error",
+        message: "Error while opening the popup"
+      });
+      if (await this.sleep(5e3), !await this.domReactConnector.send("enterUsername", {
+          username: e
+        })) throw new ExtensionError({
+        type: "user_search_error",
+        message: "Error while entering username"
+      });
+      if (await this.sleep(5e3), await this._clickOnUserIdDialogButton({
+          username: e
+        })) return _opened = !0;
+      if (this.log({
+          type: "User was not found in dialog in first attempt",
+          data: {}
+        }), !await this.domReactConnector.send("enterUsername", {
+          username: "instagra"
+        })) throw new ExtensionError({
+        type: "user_search_error",
+        message: "Error while entering username"
+      });
+      if (await this.sleep(2e3), !await this.domReactConnector.send("enterUsername", {
+          username: e
+        })) throw new ExtensionError({
+        type: "user_search_error",
+        message: "Error while entering username"
+      });
+      if (await this.sleep(5e3), await this._clickOnUserIdDialogButton({
+          username: e
+        })) return _opened = !0;
+      throw new ExtensionError({
+        type: "user_click_error",
+        message: "User was not found in popup"
+      })
+    } finally {
+      if (!_opened) {
+        try {
+          await this.domReactConnector.send("closeOpenDialogModal", {});
+          this.log({ type: "[openUser] Search dialog closed after failure (finally)", data: { username: e } });
+        } catch (_e) {
+          this.log({ type: "[openUser] closeOpenDialogModal failed (non-fatal)", data: { username: e, error: String(_e?.message || _e?.error || _e) } });
+        }
+      }
+    }
   }
   async _findUserInDialogWithoutClick({
     username: e
@@ -838,17 +905,106 @@ class ADBlockDOM {
       t = t.createConsumerStore();
     return s.getUserById(t.getState(), e)
   }
+  // P1: the pre-flight existence check. Two things used to leak a dead handle
+  // through here: (a) IG's rejection shape is not stable across builds, so
+  // reading only `statusCode` left real 404s unclassified, and (b) a 200 whose
+  // payload carries no user object returned null, which every caller read as
+  // "lead exists, id unknown". Both now produce a typed user_not_found.
   async _getUserByUsername(t) {
-    try {
-      var e = (await (await this._importNamespace("PolarisInstajax")).get_UNTYPED("https://www.instagram.com/api/v1/users/web_profile_info/?username=" + t)).data;
-      return e.user
-    } catch (e) {
-      t = e?.statusCode;
-      if (404 === t) throw Object.assign(e, { type: "user_not_found" });
-      if (429 === t) throw Object.assign(e, { type: "rate_limited" });
-      if (401 === t || 403 === t) throw Object.assign(e, { type: "auth_error" });
-      throw e;
+    // P7: normalise BEFORE validating. CSV imports routinely carry "@handle" or
+    // stray whitespace; that is our mess to clean, not evidence of a dead lead.
+    const _raw = "string" == typeof t ? t : null == t ? "" : String(t);
+    const _username = _raw.trim().replace(/^@+/, "");
+    // P7a: a missing username is a defect in the task payload, not a dead account.
+    // Non-terminal, so no contact is ever parked as unreachable over our own bug.
+    if (!_username) {
+      throw this._profileLookupError("empty username in task payload", "profile_lookup_failed", NaN, _raw);
     }
+    // P7b: IG enforces [A-Za-z0-9._] for handles. A handle containing anything
+    // else (a leading "*", say) CANNOT exist, so this is terminal by definition
+    // — and it cannot misfire the way the 200-envelope guess did for the live
+    // accounts in the 2026-09-02 logs, because no network answer is involved,
+    // only the character set IG itself
+    // enforces. Deliberately NOT gating on length: the 30-char limit has moved
+    // before, and a too-long handle already 404s, which is terminal anyway.
+    if (!/^[A-Za-z0-9._]+$/.test(_username)) {
+      throw this._profileLookupError(
+        "handle is not a syntactically valid Instagram username", "user_not_found", NaN, _username
+      );
+    }
+    let _resp;
+    try {
+      _resp = await (await this._importNamespace("PolarisInstajax"))
+        // P7c: encodeURIComponent — the old raw concat let any unescaped character
+        // corrupt the query string, yielding a 400 that classified as unknown and
+        // therefore retried forever instead of failing or succeeding cleanly.
+        .get_UNTYPED("https://www.instagram.com/api/v1/users/web_profile_info/?username=" + encodeURIComponent(_username));
+    } catch (e) {
+      const _status = Number(
+        e?.statusCode ?? e?.status ?? e?.response?.status ?? e?.response?.statusCode ?? NaN
+      );
+      const _type =
+        404 === _status ? "user_not_found" :
+        429 === _status ? "rate_limited" :
+        (401 === _status || 403 === _status) ? "auth_error" :
+        null;
+      throw this._profileLookupError(e, _type, _status, _username);
+    }
+    // P1b: read the user out of every envelope shape IG has shipped. The old
+    // code did `(await ...).data` then `.user` — if a build returns the payload
+    // without the `data` wrapper, that threw TypeError, which carried no
+    // statusCode, so it fell through as an UNCLASSIFIED pre-flight failure and
+    // the run continued into the dialog. That is the most likely reason live
+    // accounts failed pre-flight and were then found fine in the DM search.
+    // Only a genuinely absent user is user_not_found now.
+    const _user = _resp?.data?.user ?? _resp?.user ?? _resp?.data?.data?.user ?? null;
+    if (!_user) {
+      const _shape = (() => {
+        try { return Object.keys(_resp || {}).join(",") || "empty"; } catch (_) { return "unreadable"; }
+      })();
+      // P6 SAFETY: only call this user_not_found when the envelope is one we
+      // RECOGNISE and the user slot is genuinely empty. If IG ships a shape none
+      // of the reads above understand, "no user" means "we could not parse the
+      // answer", not "the account does not exist" — and since user_not_found is
+      // terminal and parks the contact as unreachable, guessing wrong there
+      // would burn every lead in the list on the day IG changes its payload.
+      // Unknown shape falls back to the old non-terminal behaviour instead.
+      const _envelopeKnown = !!_resp && "object" == typeof _resp && (
+        ("object" == typeof _resp.data && null !== _resp.data && "user" in _resp.data) ||
+        "user" in _resp
+      );
+      throw this._profileLookupError(
+        `200 response carried no user object (envelope keys: ${_shape}, recognised: ${_envelopeKnown})`,
+        _envelopeKnown ? "user_not_found" : "profile_lookup_failed", 200, _username
+      );
+    }
+    return _user;
+  }
+  // P1: build an error that survives the postMessage bridge. The bridge copies
+  // only { error, stack, type } (see ADBlockDOMConnector above), so a plain IG
+  // rejection object arrived on the content side with error:"[object Object]"
+  // and type:undefined — which is why every pre-flight failure was unreadable
+  // AND unclassifiable. `error` is set explicitly to a readable string.
+  _profileLookupError(cause, type, status, username) {
+    let _detail = "";
+    try {
+      _detail = cause instanceof Error ? String(cause.message || cause)
+        : "string" == typeof cause ? cause
+        : null == cause ? ""
+        : JSON.stringify(cause);
+    } catch (_) {
+      _detail = String(cause);
+    }
+    const err = new ExtensionError({
+      type: type || "profile_lookup_failed",
+      message: `web_profile_info(${username}) failed`
+        + (Number.isFinite(status) ? ` status=${status}` : " status=?")
+        + ` type=${type || "unclassified"}`
+        + (_detail ? ` detail=${_detail.slice(0, 200)}` : "")
+    });
+    err.error = err.message;
+    err.statusCode = Number.isFinite(status) ? status : null;
+    return err;
   }
   async _importNamespace(t) {
     for (let e = 0; e < 15; e++) {

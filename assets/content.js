@@ -782,27 +782,51 @@ class Instagram {
               target: e,
               message: t
             })) {
-            // F11: pre-flight existence check — one cheap web_profile_info call
-            // (same endpoint ColdDMs uses) before any expensive dialog work.
-            // 404 -> typed user_not_found -> retry engine treats it as terminal.
-            // Other failures (rate_limited/auth/network) are non-terminal: log
-            // and continue with the legacy flow. Skipped when the payload
-            // already carries a targetUserId or useProfile will fetch it anyway.
-            var _preflightUser = null;
-            if (!r && !_targetUserId) {
-              try {
-                _preflightUser = await this.domConnector.send("getUserByUsername", { username: e.username });
-                this.log({ type: "[sendMessage] Pre-flight: lead exists", data: { username: e.username, userId: _preflightUser?.id ?? null } });
-              } catch (_pfErr) {
-                if (_pfErr?.type === "user_not_found") {
-                  throw new ExtensionError({
-                    type: "user_not_found",
-                    message: "Lead handle does not exist on Instagram — skipping all dialog work"
-                  });
-                }
-                this.log({ type: "[sendMessage] Pre-flight lookup failed (non-terminal, continuing)", data: { username: e.username, error: _pfErr?.toString?.() } });
-              }
+            // P8a: route-independent handle sanity check, ahead of every branch
+            // below. IG enforces [A-Za-z0-9._] for usernames, so a handle holding
+            // anything else CANNOT exist and needs no network answer to rule out.
+            // dom.js:_getUserByUsername already rejects these, but the routes that
+            // skipped the pre-flight reached the dialog search without ever calling
+            // it, which is how one bad handle spent four retries hammering IG
+            // search for an account that could never resolve.
+            const _rawHandle = "string" == typeof e?.username ? e.username : null == e?.username ? "" : String(e.username);
+            const _cleanHandle = _rawHandle.trim().replace(/^@+/, "");
+            // An EMPTY handle is a defect in our own task payload, not a dead
+            // account: deliberately left non-terminal so no contact is ever parked
+            // as unreachable because of our bug.
+            if (_cleanHandle && !/^[A-Za-z0-9._]+$/.test(_cleanHandle)) {
+              this.log({ type: "[sendMessage] Handle is not a valid Instagram username - terminal, skipping all dialog work", data: { username: _rawHandle, taskId: s } });
+              throw new ExtensionError({
+                type: "user_not_found",
+                message: "Lead handle is not a syntactically valid Instagram username"
+              });
             }
+            // "@handle" and stray whitespace are import mess, ours to clean. dom.js
+            // normalises for its own API call, but the dialog search types
+            // e.username verbatim into IG's search box, where a leading "@" matches
+            // nothing and a live lead fails exactly as if it were dead. Normalise
+            // once here so every route below sees the same handle.
+            if (_cleanHandle && _cleanHandle !== _rawHandle) {
+              this.log({ type: "[sendMessage] Normalised lead handle", data: { from: _rawHandle, to: _cleanHandle, taskId: s } });
+              e.username = _cleanHandle;
+            }
+            // P7: there is no pre-flight existence check any more. F11 used to spend
+            // one web_profile_info call here on EVERY send, before any dialog work.
+            // Two things were wrong with that. It is pure waste on a successful send
+            // — every consumer of the result sat on a failure path, so a send that
+            // worked paid for an answer nobody read. And it made the borrowed API
+            // the first oracle even though IG's own DM search is the better one: in
+            // the 2026-09-03 production session the search box answered correctly
+            // 3 of 3 times (one hit for each live handle, zero for the dead one)
+            // while 3 of 3 web_profile_info calls came back 429.
+            //
+            // The order is now inverted. Search first; if it finds the lead, no API
+            // call happens at all. The API is consulted only as a tiebreak, only
+            // after the dialog has already reported the handle missing — see
+            // _askApiIfHandleIsDead. This memo carries that one answer between the
+            // two places below that can reach the tiebreak, so a task spends one
+            // call, never two.
+            var _apiDeadCheck = {};
             if (r) l = await this.domConnector.send("getUserByUsername", {
               username: e.username
             }), this.log({
@@ -837,8 +861,21 @@ class Instagram {
                     username: e.username
                   }, { timeoutMs: 240000 });
                 } catch (_dialogThrowErr) {
-                  this.log({ type: "[Followup] findUserInDialogWithoutClick threw — treating as null threadId", data: { username: e.username, taskId: s, error: String(_dialogThrowErr?.message || _dialogThrowErr) } });
+                  this.log({ type: "[Followup] findUserInDialogWithoutClick threw — treating as null threadId", data: { username: e.username, taskId: s, error: describeBridgeError(_dialogThrowErr), errorType: _dialogThrowErr?.type ?? null } });
                   h = null;
+                  // P7: the dialog looked and found nothing. Ask the profile API
+                  // once (memoised) and act only on a clean 404: that handle does
+                  // not exist, so falling through would run a SECOND full dialog
+                  // search — ~60s more — for an account that is not there, then
+                  // surface user_click_error, which the retry engine repeats three
+                  // more times. Any other answer DOES fall through, because
+                  // openUser searches differently — it re-primes the box with an
+                  // "instagra" cache-buster between its two tries — and regularly
+                  // finds leads this scrape missed.
+                  if (_dialogThrowErr?.type === "user_click_error") {
+                    const _v = await this._askApiIfHandleIsDead(e.username, _apiDeadCheck, s);
+                    if (_v === "dead") throw this._missingUserError(_v, e.username);
+                  }
                 }
                 var _liveThreadId = h?.candidate?.id ?? null;
                 this.log({ type: "[Followup] Live thread id scraped from search results", data: { username: e.username, taskId: s, threadId: _liveThreadId, matched: !!h?.candidate } });
@@ -861,48 +898,35 @@ class Instagram {
                 // path below instead of handing off a blank id.
                 this.log({ type: "[Followup] No live thread id — falling back to main-tab send", data: { username: e.username, taskId: s } });
               }
-              // F7: dialog search is the flaky step (fiber typing can silently
-              // no-op -> 20 suggestion rows -> "No fiber match" -> timeout).
-              // On failure, fall back to ColdDMs' profile route: top-bar search
-              // matched by numeric ID + Message button + verified inbox arrival.
+              // F7/P7: the dialog search is the flaky step (fiber typing can
+              // silently no-op -> 20 suggestion rows -> "No fiber match" ->
+              // timeout). It used to fall back to ColdDMs' profile route here.
+              // That route is gone: across every diagnostics session on record it
+              // was attempted 8 times and succeeded 0 — "Received target user id"
+              // never once appeared — so it only ever added a second API call and
+              // a second failure to the same doomed task.
               try {
                 await this.domConnector.send("openUser", {
                   username: e.username
                 }, { timeoutMs: 240000 });
               } catch (_dialogErr) {
+                const _dt = _dialogErr?.type ?? null;
                 this.log({
-                  type: "[sendMessage] Dialog open failed — falling back to profile route",
-                  data: { username: e.username, error: String(_dialogErr?.message || _dialogErr) }
+                  type: "[sendMessage] Dialog open failed",
+                  data: { username: e.username, error: describeBridgeError(_dialogErr), errorType: _dt }
                 });
-                // Reuse the F11 pre-flight result — no second API call.
-                let _profUser = _preflightUser;
-                if (!_profUser?.id) {
-                  try {
-                    _profUser = await this.domConnector.send("getUserByUsername", { username: e.username });
-                  } catch (_idErr) {
-                    if (_idErr?.type === "user_not_found") {
-                      throw new ExtensionError({ type: "user_not_found", message: "Lead handle does not exist on Instagram" });
-                    }
-                    throw _dialogErr;
-                  }
-                }
-                if (!_profUser?.id) throw _dialogErr;
-                try {
-                  await this.domConnector.send("openChatFromProfile", {
-                    username: e.username,
-                    id: _profUser.id
-                  });
-                  this.log({ type: "[sendMessage] User opened via profile route", data: { username: e.username, userId: _profUser.id } });
-                } catch (_profErr) {
-                  const _msg = String(_profErr?.message || "");
-                  if (_msg.includes("do not allow")) {
-                    throw new ExtensionError({
-                      type: "user_does_not_accept_dms",
-                      message: "Lead does not allow new messages (no Message button on profile)"
-                    });
-                  }
-                  throw _dialogErr;
-                }
+                // P7: only user_click_error is evidence about the PERSON. It is
+                // reachable solely after the modal opened, the handle was typed
+                // twice with an "instagra" cache-buster between the tries, and
+                // ~20 result polls came back empty (dom.js:456). The other types
+                // are evidence about the DIALOG — open_search_popup_error means
+                // the modal never opened, user_search_error means the query could
+                // not be typed, a timeout means neither happened in time. None of
+                // those say anything about whether the lead exists, so they keep
+                // their transient classification and their full retry budget.
+                if (_dt !== "user_click_error") throw _dialogErr;
+                const _verdict = await this._askApiIfHandleIsDead(e.username, _apiDeadCheck, s);
+                throw this._missingUserError(_verdict, e.username);
               }
               this.log({ type: "User opened", data: {} });
             } else this.log({
@@ -973,7 +997,7 @@ class Instagram {
               } else {
                 // Unresolved {{placeholder}} (backend had no name for this lead)
                 // — scrape the real name from Instagram and fill it in.
-                var _resolved = await this._resolveLiveName(t.text, e.username);
+                var _resolved = await this._resolveLiveName(t.text, e.username, e.fullName);
                 f = _resolved.message;
                 _resolvedFullName = _resolved.fullName;
               }
@@ -1148,20 +1172,12 @@ class Instagram {
           // slip in while the pre-flight call below is in flight. The finally
           // block resets it if we throw.
           this.isBusy = !0, this.taskId = s, this._checkIfUserReceivedBlockMessage();
-          // F11: pre-flight existence check (same as main tab). Ghost leads
-          // must die here in one call, not after minutes of dialog polling.
-          var _pfUser = null;
-          try {
-            _pfUser = await this.domConnector.send("getUserByUsername", { username: e.username });
-          } catch (_pfErr) {
-            if (_pfErr?.type === "user_not_found") {
-              throw new ExtensionError({
-                type: "user_not_found",
-                message: "Lead handle does not exist on Instagram — skipping all dialog work"
-              });
-            }
-            this.log({ type: "[sendMessageFromDialog] Pre-flight lookup failed (non-terminal, continuing)", data: { username: e.username, error: _pfErr?.toString?.() } });
-          }
+          // P7: no pre-flight here either — same reasoning as the main-tab route.
+          // The additional tab is the followup path, so the lead has already been
+          // messaged successfully at least once; spending a web_profile_info call
+          // to re-ask whether they exist, before the dialog has complained about
+          // anything, was the least justified of the two. Memo for the tiebreak.
+          var _pfDeadCheck = {};
           if (await this.domConnector.send("preTaskHooks", {}), await this.sleep(5e3), await this._checkIfOpenUserRequired({
               username: e.username
             })) {
@@ -1176,26 +1192,18 @@ class Instagram {
               await this.domConnector.send("openUser", { username: e.username }, { timeoutMs: 240000 });
               await this.sleep(5e3);
             } catch (openErr) {
-              this.log({ type: "[Followup] openUser failed — trying profile route", data: { username: e.username, error: openErr?.toString?.() } });
-              // F7: same fallback as main tab — ID-matched profile route when
-              // the dialog search silently fails. If it also fails, fall
-              // through to the existing hard-failure check below.
-              try {
-                const _profUser = await this.domConnector.send("getUserByUsername", { username: e.username });
-                if (_profUser?.id) {
-                  await this.domConnector.send("openChatFromProfile", { username: e.username, id: _profUser.id });
-                  this.log({ type: "[Followup] Thread opened via profile route", data: { username: e.username, userId: _profUser.id } });
-                  await this.sleep(5e3);
-                }
-              } catch (profErr) {
-                const _msg = String(profErr?.message || "");
-                if (_msg.includes("do not allow")) {
-                  throw new ExtensionError({
-                    type: "user_does_not_accept_dms",
-                    message: "Lead does not allow new messages (no Message button on profile)"
-                  });
-                }
-                this.log({ type: "[Followup] Profile route also failed", data: { error: profErr?.toString?.() } });
+              const _ot = openErr?.type ?? null;
+              this.log({ type: "[Followup] openUser failed", data: { username: e.username, error: describeBridgeError(openErr), errorType: _ot } });
+              // P7: same split as the main-tab route — user_click_error is the only
+              // type that means IG's search looked and found nothing, so it is the
+              // only one that earns an API tiebreak. Everything else falls through
+              // to the _checkIfOpenUserRequired self-recovery check below, exactly
+              // as before, because the thread may well have opened anyway.
+              // The profile-route fallback that used to sit here is gone: 0 of 8
+              // recorded attempts ever succeeded.
+              if (_ot === "user_click_error") {
+                const _verdict = await this._askApiIfHandleIsDead(e.username, _pfDeadCheck, s);
+                throw this._missingUserError(_verdict, e.username);
               }
             }
             if (await this._checkIfOpenUserRequired({ username: e.username })) {
@@ -1267,7 +1275,7 @@ class Instagram {
               } else {
                 // Unresolved {{placeholder}} (backend had no name for this lead)
                 // — scrape the real name from Instagram and fill it in.
-                var _resolved = await this._resolveLiveName(t.text, e.username);
+                var _resolved = await this._resolveLiveName(t.text, e.username, e.fullName);
                 g = _resolved.message;
                 _resolvedFullName = _resolved.fullName;
               }
@@ -1502,6 +1510,75 @@ class Instagram {
     }), await this.deleteDelayedTask(), await this.tasks[e](t, {
       attempt: s
     })
+  }
+  // P7: the profile API is a tiebreak, not a gate. It is called only after IG's
+  // own DM search has already reported the handle missing, and its answer is
+  // memoised on `memo` so a task that reaches two different dialog failure points
+  // spends one call, not two. Replaces _deadHandleOrDialogError, which had to
+  // reason about a pre-flight that no longer happens. Returns:
+  //   "dead"    — clean 404 from web_profile_info; the account does not exist
+  //   "alive"   — the handle resolved to a real user id, so the search index is
+  //               the thing that is wrong, not the lead
+  //   "unknown" — 429 / auth / network / unparseable; no answer either way, so
+  //               IG's search box stays the best evidence we have
+  async _askApiIfHandleIsDead(username, memo, taskId) {
+    if (memo && memo.verdict) {
+      this.log({ type: "[deadCheck] Reusing memoised verdict — no second API call", data: { username, verdict: memo.verdict, taskId } });
+      return memo.verdict;
+    }
+    let verdict = "unknown";
+    try {
+      const u = await this.domConnector.send("getUserByUsername", { username });
+      verdict = u?.id ? "alive" : "unknown";
+      this.log({
+        type: verdict === "alive"
+          ? "[deadCheck] API resolved the handle — DM search is stale, not the lead"
+          : "[deadCheck] API answered without a user id — no verdict",
+        data: { username, userId: u?.id ?? null, taskId }
+      });
+    } catch (err) {
+      if (err?.type === "user_not_found") {
+        verdict = "dead";
+        this.log({ type: "[deadCheck] API returned 404 — handle is dead", data: { username, taskId } });
+      } else {
+        this.log({
+          type: "[deadCheck] API gave no usable answer — deferring to IG DM search",
+          data: { username, error: describeBridgeError(err), errorType: err?.type ?? null, statusCode: err?.statusCode ?? null, taskId }
+        });
+      }
+    }
+    if (memo) memo.verdict = verdict;
+    return verdict;
+  }
+  // P7: turn a tiebreak verdict into the error the retry engine acts on. The
+  // one-retry ceiling for the two search_missing_* classes lives in background.js
+  // (RETRY_CEILING) because the content script is never told the task's
+  // retry_count. Between retries the background already tears the tab down and
+  // the next claim opens a fresh one, so "reload the tab and try once more" needs
+  // no code here — capping the retry count IS that reload.
+  _missingUserError(verdict, username) {
+    if (verdict === "dead") {
+      this.log({ type: "[deadCheck] Verdict: dead handle — terminal, contact will be parked", data: { username } });
+      return new ExtensionError({
+        type: "user_not_found",
+        message: "Handle not found in IG DM search and 404 from the profile API — dead handle, no retries"
+      });
+    }
+    if (verdict === "alive") {
+      // The account demonstrably exists, so the contact must NOT be parked when
+      // the one retry runs out: a live lead IG's search cannot surface right now
+      // (index lag, a privacy setting) has to stay claimable by a later campaign.
+      this.log({ type: "[deadCheck] Verdict: alive but unsearchable — one retry on a fresh tab, contact NOT parked", data: { username } });
+      return new ExtensionError({
+        type: "search_missing_alive",
+        message: "Profile API confirms this account exists but IG DM search cannot find it — one retry on a fresh tab"
+      });
+    }
+    this.log({ type: "[deadCheck] Verdict: unproven — one retry on a fresh tab, then park", data: { username } });
+    return new ExtensionError({
+      type: "search_missing_unproven",
+      message: "IG DM search found nothing and the profile API gave no answer — one retry on a fresh tab"
+    });
   }
   async _checkIfOpenUserRequired({
     username: e
@@ -2001,17 +2078,31 @@ class Instagram {
       await this.sleep(1e3)
     }
   }
-  async _resolveLiveName(t, e) {
-    // t = raw template text, e = username.
+  async _resolveLiveName(t, e, a = null) {
+    // t = raw template text, e = username, a = full_name the server already had.
     // Returns { message, fullName }. Never sends a literal {{placeholder}}:
     //  - no `{{` → already resolved server-side, send as-is.
+    //  - payload carries a real name → use it, no Instagram call at all.
     //  - scrape succeeds → fill real name, return it (for DB write-back).
-    //  - scrape fails → clean-strip the placeholders, never leak literal tokens.
+    //  - scrape fails → fall back to the username, never leak literal tokens.
     if (!t.includes("{{")) return { message: t, fullName: null };
-    let s = null;
-    try {
-      s = await this.domConnector.send("getUserByUsername", { username: e });
-    } catch (err) {}
+    // N1: a server-supplied name WINS over the live lookup, exactly like
+    // ColdDMs (its content.js:637 checks e.fullName before calling the API).
+    // The lookup borrows Instagram's own importNamespace("PolarisInstajax")
+    // loader and is the flakiest call in the whole send path, so every send
+    // that can avoid it must. background.js filters username-placeholders out
+    // of contacts.full_name via usableFullName(), so whatever arrives here is
+    // a real name and never the lead's own handle.
+    const _payloadName = "string" == typeof a ? a.trim() : "";
+    const _fromPayload = !!_payloadName;
+    let s = _fromPayload ? { full_name: _payloadName, username: e } : null;
+    if (_fromPayload) {
+      this.log({ type: "Using server-supplied lead name — skipping Instagram lookup", data: { username: e, fullName: _payloadName } });
+    } else {
+      try {
+        s = await this.domConnector.send("getUserByUsername", { username: e });
+      } catch (err) {}
+    }
     if (s) {
       const firstName = (u) =>
         u?.full_name
@@ -2019,27 +2110,28 @@ class Instagram {
             ? normalizeUnicodeText(parseFullName(u.full_name)?.first || u.username || "")
             : normalizeUnicodeText(u.full_name || "")
           : normalizeUnicodeText(u.username || "");
-      const fn = firstName(s);
+      // F-NAME-01: {{firstName}} falls back to the username, same as {{name}}.
+      const fn = firstName(s) || e;
       const message = t
         .replace(/\{\{\s*username\s*\}\}/gi, () => e)
         .replace(/\{\{\s*name\s*\}\}/gi, () => s?.full_name ?? e)
         // E-09 FIX: added `i` flag — users write {{FirstName}} (capital F),
         // the old regex only matched camelCase `firstName` causing literal tokens to ship.
         .replace(/[ \t]*\{\{\s*firstName\s*\}\}[ \t]*/gi, (m) =>
-          fn
-            ? m.replace(/\{\{\s*firstName\s*\}\}/i, fn)
-            : /^[ \t]/.test(m) && /[ \t]$/.test(m) ? " " : "");
-      this.log({ type: "Resolved live name from Instagram", data: { fullName: s.full_name, message } });
-      return { message, fullName: s.full_name || null };
+          m.replace(/\{\{\s*firstName\s*\}\}/i, fn));
+      this.log({ type: _fromPayload ? "Resolved name from server payload (no Instagram call)" : "Resolved live name from Instagram", data: { fullName: s.full_name, message } });
+      return { message, fullName: _fromPayload ? null : (s.full_name || null) };
     }
+    // F-NAME-01: lookup failed, so no real name exists. Fall back to the username
+    // for {{firstName}} too — deleting the token shipped subject-less openers.
     const message = t
       .replace(/\{\{\s*username\s*\}\}/gi, () => e)
       .replace(/\{\{\s*name\s*\}\}/gi, () => e)
       // E-09 FIX: added `i` flag — same fix as fill branch above.
       // Without this, {{FirstName}} (capital F) survived the strip and shipped literally.
       .replace(/[ \t]*\{\{\s*firstName\s*\}\}[ \t]*/gi, (m) =>
-        /^[ \t]/.test(m) && /[ \t]$/.test(m) ? " " : "");
-    this.log({ type: "getUserByUsername failed — stripped unresolved placeholders", data: { message } });
+        m.replace(/\{\{\s*firstName\s*\}\}/i, e));
+    this.log({ type: "getUserByUsername failed — fell back to username for placeholders", data: { message } });
     return { message, fullName: null };
   }
   async back() {
@@ -2125,7 +2217,7 @@ class Instagram {
       let e = s.text;
       let _resolvedFullName = null;
       if (e.includes("{{")) {
-        var _resolved = await this._resolveLiveName(s.text, t.username);
+        var _resolved = await this._resolveLiveName(s.text, t.username, t.fullName);
         e = _resolved.message;
         _resolvedFullName = _resolved.fullName;
       }
@@ -2233,6 +2325,30 @@ function normalizeUnicodeText(e) {
 }(async () => {
   await (new Instagram).init()
 })();
+// P3: the cross-world bridges (ReactDev -> dom -> content) serialize a thrown
+// error down to a plain { error, stack, type } object, so on this side it is NOT
+// an Error: `.message` is undefined and `.toString()` is always "[object
+// Object]". That is why every pre-flight failure in the logs read
+// error:"[object Object]" and why message-substring checks silently never
+// matched. Always route bridge errors through this.
+function describeBridgeError(err) {
+  if (err == null) return String(err);
+  if (err instanceof Error) return `${err.message || err}${err.type ? ` [${err.type}]` : ""}`;
+  if (typeof err === "string") return err;
+  // P3-b: err.error can ITSELF be an object (dom.js sets error: e?.error || ...),
+  // and interpolating it yields the very "[object Object]" this helper exists to
+  // prevent. Stringify a non-string instead of destroying the evidence.
+  let msg = err.error || err.message || null;
+  if (msg != null && typeof msg !== "string") {
+    try { msg = JSON.stringify(msg).slice(0, 300); } catch (_) { msg = null; }
+  }
+  if (msg) return `${msg}${err.type ? ` [${err.type}]` : ""}`;
+  try {
+    return JSON.stringify(err).slice(0, 300);
+  } catch (_) {
+    return String(err);
+  }
+}
 class ExtensionError extends Error {
   constructor({
     message: e,
