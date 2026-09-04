@@ -476,10 +476,14 @@ class Instagram {
       this.log({ type: "[Additional] Dom injected", data: {} });
       this.registerTasks();
       this.log({ type: "[Additional] Tasks registered", data: {} });
-      // ADDL-FAST-01 v2: no viewer wait in init (see initMain) — the reply
-      // flow's own pacing covers React mount time, and the open-check's
-      // additional-tab URL trust handles a store that isn't hydrated yet.
-      await this.domConnector.send("preTaskHooks", {}).catch(e => this.log({ type: "[Additional] preTaskHooks error", data: { error: e?.message } }));
+      // ADDL-FAST-01 v3: preTaskHooks is fire-and-forget here too — on a cold
+      // tab it reaches into React fibers that aren't mounted yet and held the
+      // gate 32s against the bridge's 30s timeout (09-05 log). Every send
+      // task calls preTaskHooks itself at its start, so init's call is just
+      // early hygiene; the reply flow's own pacing covers React mount time,
+      // and the open-check's additional-tab URL trust handles a store that
+      // isn't hydrated yet.
+      this.domConnector.send("preTaskHooks", {}).catch(e => this.log({ type: "[Additional] preTaskHooks error", data: { error: e?.message } }));
       this.injectIntoChatWithRetry().catch(e => this.log({ type: "[Additional] injectIntoChat error", data: { error: e?.message } }));
       this.log({ type: "[Additional] Chat handler injected (deferred)", data: {} });
     } catch (e) {
