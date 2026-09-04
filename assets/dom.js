@@ -1018,8 +1018,11 @@ class ADBlockDOM {
     }
     throw new Error("Module not found")
   }
-  async _importDefault(t) {
-    for (let e = 0; e < 15; e++) {
+  async _importDefault(t, _maxAttempts = 15) {
+    // _maxAttempts: same rationale as _importNamespace — hot-path callers pass
+    // a small bound so a module that will never appear fails in seconds, not
+    // 15-30s of bridge round-trips.
+    for (let e = 0; e < _maxAttempts; e++) {
       var s = importDefault(t);
       if (s) return s;
       await this.sleep(1e3)

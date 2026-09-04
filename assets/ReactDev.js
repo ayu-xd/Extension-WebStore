@@ -1633,8 +1633,9 @@
         }
         throw new Error("Module not found");
       }
-      async _importDefault(t) {
-        for (let e = 0; e < 15; e++) {
+      async _importDefault(t, _maxAttempts = 15) {
+        // _maxAttempts: hot-path callers pass a small bound — see LEGACY-FAST.
+        for (let e = 0; e < _maxAttempts; e++) {
           var r = importDefault(t);
           if (r) return r;
           await this.sleep(1e3);
@@ -1658,16 +1659,19 @@
           .getSource()
           .toJSON();
       }
-      async _findReStoreTable(t) {
-        for (let e = 0; e < 20; e++) {
+      async _findReStoreTable(t, _maxAttempts = 20) {
+        // _maxAttempts: the LEGACY-FAST fallback read passes a small bound —
+        // 20x500ms per table x 5 tables was ~50s per getAllMessages call on
+        // accounts whose ReStore provider no longer exists.
+        for (let e = 0; e < _maxAttempts; e++) {
           var r = this.root.findOne("ReStoreProvider.react")?.element?.memoizedProps?.db?.tables?.[t];
           if (r) return r;
           await this.sleep(500);
         }
         throw new Error("ReStore table was not found: " + t);
       }
-      async _getDatabase(e) {
-        e = await this._findReStoreTable(e);
+      async _getDatabase(e, _maxAttempts) {
+        e = await this._findReStoreTable(e, _maxAttempts);
         return require("ReQL").toArrayAsync(require("ReQL").fromTableAscending(e));
       }
       async _getDatabaseIterator(e) {
@@ -1907,11 +1911,18 @@
       // The Relay thread status is request-state, not reply-deliverability; the
       // map always reports "0" (see _getAllMessagesFromRelay).
       async _getAllMessagesUnsafe() {
-        const t = await this._importDefault("bs_caml_int64");
-        var e = (await this._getDatabase("messages")).map((e) => this._formatData({ data: e, bs_caml_int64: t })),
-          r = (await this._getDatabase("contacts")).map((e) => this._formatData({ data: e, bs_caml_int64: t })),
-          s = (await this._getDatabase("ig_contact_info")).map((e) => this._formatData({ data: e, bs_caml_int64: t })),
-          n = (await this._getDatabase("server_search_results")).map((e) =>
+        // LEGACY-FAST: this is the FALLBACK read (Relay owns the primary). On
+        // migrated accounts every _getDatabase here burns _findReStoreTable's
+        // 20x500ms ladder before throwing — 5 tables = ~50s PER CALL, which
+        // the reply guard and hydration loops paid on every poll before
+        // falling back to the DOM. Bounded to 2 attempts (~1s) per table: if
+        // the ReStore provider is there it answers on the first try, and if
+        // it is gone, more waiting finds nothing.
+        const t = await this._importDefault("bs_caml_int64", 2);
+        var e = (await this._getDatabase("messages", 2)).map((e) => this._formatData({ data: e, bs_caml_int64: t })),
+          r = (await this._getDatabase("contacts", 2)).map((e) => this._formatData({ data: e, bs_caml_int64: t })),
+          s = (await this._getDatabase("ig_contact_info", 2)).map((e) => this._formatData({ data: e, bs_caml_int64: t })),
+          n = (await this._getDatabase("server_search_results", 2)).map((e) =>
             this._formatData({ data: e, bs_caml_int64: t }),
           ),
           o = this._getUsersByBadge().map((e) => this._formatData({ data: e, bs_caml_int64: t }));

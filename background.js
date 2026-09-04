@@ -1825,15 +1825,23 @@ async function pollTasks() {
 
         const currentRetries = Number(task.retry_count || 0);
 
-        // P7: per-class retry ceiling. Default stays 3. The two search_missing_*
-        // classes get exactly 1, which is what "if IG's DM search cannot find the
-        // lead, reload the tab and try once more, then stop" compiles down to:
-        // the F-BUSY-02 teardown ladder above already closes the main tab on these
-        // classes, so the retry claim opens a fresh one. Capping the count IS the
-        // reload. A dead handle used to cost 4 attempts and ~7.5 minutes; it now
-        // costs 2 and ~4, or 1 when the profile API returns a clean 404 — that
-        // arrives as user_not_found, which is permanent and never retries at all.
-        const RETRY_CEILING = { search_missing_alive: 1, search_missing_unproven: 1 };
+        // P7: per-class retry ceiling. Default stays 3. The dialog attempt
+        // itself is byte-identical to ColdDMs' _openUser (2 typed tries, 10
+        // result polls each, then user_click_error) — the DELTA from ColdDMs
+        // was the fresh-tab retry for the search_missing_* classes, and the
+        // 09-05 log shows what it bought on mrsclaudiaserra: a second tab,
+        // ~84s more dialog polling, the same zero results. ColdDMs fails the
+        // task and lets the backend decide; our equivalent is fail + same-day
+        // retire + tomorrow's scheduler cycle, which is the retry. So:
+        //   • search_missing_alive keeps 1 fresh-tab retry — the profile API
+        //     positively resolved the account, so index lag is plausible and
+        //     the lead is never parked.
+        //   • search_missing_unproven gets 0 — nothing was proven either way,
+        //     a second blind search added no information, and the lead still
+        //     comes back tomorrow via normal regeneration. "Try the username,
+        //     then make them fuck off" — one clean attempt, no tab drama.
+        // A dead handle (user_not_found) is permanent and never retries.
+        const RETRY_CEILING = { search_missing_alive: 1, search_missing_unproven: 0 };
         const maxRetries = RETRY_CEILING[retryClass] ?? 3;
 
         // E-04/P5 note: the old inbox-freshen block that lived here only covered

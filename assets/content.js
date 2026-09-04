@@ -1554,10 +1554,10 @@ class Instagram {
   // one of the functional getUserByUsername calls we have to make anyway to open
   // a thread. Neither is a request invented in order to form an opinion.
   _searchMissedError(username) {
-    this.log({ type: "[searchMiss] IG DM search found nothing — one retry on a fresh tab, contact NOT parked", data: { username } });
+    this.log({ type: "[searchMiss] IG DM search found nothing — task fails, contact NOT parked, back tomorrow", data: { username } });
     return new ExtensionError({
       type: "search_missing_unproven",
-      message: "Instagram's DM search could not find this handle — nothing was sent, one retry on a fresh tab"
+      message: "Instagram's DM search could not find this handle — nothing was sent, and we'll try again on the next scheduled run"
     });
   }
   async _checkIfOpenUserRequired({
