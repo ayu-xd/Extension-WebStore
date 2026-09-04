@@ -1775,6 +1775,13 @@
         if (this._relayEnvCache) {
           try { this._relayEnvCache.getStore().getSource(); return this._relayEnvCache; } catch (e) { this._relayEnvCache = null; }
         }
+        // Negative cache: a full fiber-tree scan on Instagram is expensive,
+        // and before React mounts it finds NOTHING. Callers poll (viewer
+        // retries every 5s, getAllMessages per send) — without this, each
+        // poll paid the whole scan again. 2s window keeps first-detection
+        // fast while making the polling cheap.
+        if (this._relayEnvScanAt && Date.now() - this._relayEnvScanAt < 2000) return null;
+        this._relayEnvScanAt = Date.now();
         const isEnv = (v) => v && typeof v === "object" &&
           typeof v.getStore === "function" &&
           (typeof v.execute === "function" || v._network != null);

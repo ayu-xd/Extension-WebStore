@@ -442,17 +442,18 @@ class Instagram {
       this.log({ type: "Dom injected", data: {} });
       this.registerTasks();
       this.log({ type: "Tasks registered", data: {} });
-      // ADDL-FAST-01: the viewer read is a PREFETCH now, not a gate — 3s cap.
-      // It has never succeeded in a month of logs because React mounts 15-30s
-      // after the page on cold background tabs, and holding init open for it
-      // stalled every task 30-47s. Registration and the chat handler run in
-      // the background with their own retry ladders; the gate below clears in
-      // ~1-10s and tasks start immediately.
-      const viewerInfo = await this.waitForViewerReady({ timeoutMs: 10000 }).catch(e => { this.log({ type: "[initMain] waitForViewerReady error", data: { error: e?.message } }); return null; });
-      this.log({ type: "[initMain] Calling preTaskHooks", data: {} });
-      await this.domConnector.send("preTaskHooks", {}).catch(e => this.log({ type: "[initMain] preTaskHooks error", data: { error: e?.message } }));
+      // ADDL-FAST-01 v2: init does NOT wait for the viewer at all. The viewer
+      // answer depends on React mounting (15-30s after the page on cold
+      // background tabs), and a poll cannot be bounded — one failing poll =
+      // 5s bridge timeout + legacy module ladder + a full fiber scan, which
+      // overran every cap we tried (10s cap still held the gate 31s in the
+      // 09-05 log). The binding it feeds is a one-time DB operation:
+      // registerAccountsWithRetry owns it in the background and bound
+      // @ayu.unlimited at attempts:1 in the same log, seconds after the gate
+      // cleared. ColdDMs never gated sends on this either — its init is a
+      // blind 7s sleep with no viewer check at all.
       this.log({ type: "[initMain] registerAccounts (background)", data: {} });
-      this.registerAccountsWithRetry(viewerInfo).catch(e => this.log({ type: "[initMain] registerAccounts error", data: { error: e?.message } }));
+      this.registerAccountsWithRetry(null).catch(e => this.log({ type: "[initMain] registerAccounts error", data: { error: e?.message } }));
       this.log({ type: "[initMain] injectIntoChat (background)", data: {} });
       this.injectIntoChatWithRetry().catch(e => this.log({ type: "[initMain] injectIntoChat error", data: { error: e?.message } }));
       this.log({ type: "Chat handler injected (deferred)", data: {} });
@@ -475,10 +476,9 @@ class Instagram {
       this.log({ type: "[Additional] Dom injected", data: {} });
       this.registerTasks();
       this.log({ type: "[Additional] Tasks registered", data: {} });
-      // ADDL-FAST-01: same prefetch-and-defer pattern as initMain — 3s viewer
-      // cap, registration and chat handler in the background. The gate below
-      // clears in ~1-10s instead of holding the reply 40-47s.
-      await this.waitForViewerReady({ timeoutMs: 10000 }).catch(e => this.log({ type: "[Additional] waitForViewerReady error", data: { error: e?.message } }));
+      // ADDL-FAST-01 v2: no viewer wait in init (see initMain) — the reply
+      // flow's own pacing covers React mount time, and the open-check's
+      // additional-tab URL trust handles a store that isn't hydrated yet.
       await this.domConnector.send("preTaskHooks", {}).catch(e => this.log({ type: "[Additional] preTaskHooks error", data: { error: e?.message } }));
       this.injectIntoChatWithRetry().catch(e => this.log({ type: "[Additional] injectIntoChat error", data: { error: e?.message } }));
       this.log({ type: "[Additional] Chat handler injected (deferred)", data: {} });
