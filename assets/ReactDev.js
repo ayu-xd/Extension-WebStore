@@ -1279,15 +1279,40 @@
         throw new Error("No wrapper");
       }
       async _getUser() {
-        var e = this._getState();
-        if (!e) throw new Error("No state");
-        var t = e.users.viewerId;
-        if (!t) throw new Error("No viewerId");
-        e = e.users?.users?.toJSON?.();
-        if (!e) throw new Error("No users in state");
-        e = e[t];
-        if (e) return e;
-        throw new Error("No user in state");
+        try {
+          var e = this._getState();
+          if (!e) throw new Error("No state");
+          var t = e.users.viewerId;
+          if (!t) throw new Error("No viewerId");
+          e = e.users?.users?.toJSON?.();
+          if (!e) throw new Error("No users in state");
+          e = e[t];
+          if (e) return e;
+          throw new Error("No user in state");
+        } catch (legacyErr) {
+          // Relay fallback: on Slide-stack accounts the legacy state store is
+          // dead, so this read threw on every call and waitForViewerReady
+          // burned its whole window on every init — 14 log files spanning
+          // Aug 7 -> Sep 4 contain 20+ timeouts and ZERO successes, and each
+          // one stretched task startup by 15-40s. The Relay viewer record is
+          // always present on a logged-in page (client:root:viewer ->
+          // XDTUserDict), so init proceeds on the first poll instead.
+          try {
+            const env = this._getRelayEnv();
+            if (env) {
+              const recs = env.getStore().getSource().toJSON();
+              const ref = recs["client:root:viewer"]?.xdt_user?.__ref;
+              const u = ref ? recs[ref] : null;
+              if (u?.username)
+                return {
+                  id: String(u.pk ?? u.id ?? String(ref).split(":")[1] ?? ""),
+                  username: u.username,
+                  profilePictureUrl: u.profile_pic_url ?? null,
+                };
+            }
+          } catch (relayErr) { /* fall through to the original error */ }
+          throw legacyErr;
+        }
       }
       async _getMessages() {
         for (let e = 0; e < 15 && !this.root.findMany("MWPBaseMessage.react").length; e++) await this.sleep(1e3);

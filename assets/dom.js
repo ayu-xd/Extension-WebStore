@@ -1023,6 +1023,27 @@ class ADBlockDOM {
     throw new Error("Module not found")
   }
   async _getUser() {
+    // ADDL-FAST-01: ask the Relay store first — it answers in milliseconds and
+    // is always populated on a logged-in page. The PolarisConfig ladder below
+    // retries a missing module 15x1s on migrated builds, and it runs on EVERY
+    // getInfo poll during init: the 2026-09-04 bundles show 15-40s of
+    // "Waiting for initialization" per send because waitForViewerReady's
+    // window was consumed by one or two of those ladders before the page's
+    // viewer data ever arrived. The legacy path stays as the fallback.
+    try {
+      const {
+        id: s,
+        username: e,
+        profilePictureUrl: n
+      } = await this.domReactConnector.send("getUser", {});
+      if (e && "Instagram User" !== e) {
+        return {
+          username: e.startsWith("@") ? e.substring(1) : e,
+          profile_pic_url: n,
+          id: s
+        }
+      }
+    } catch (_relayErr) { /* fall through to the legacy PolarisConfig path */ }
     if (!(await this._importNamespace("PolarisConfig"))?.getViewerData_DO_NOT_USE?.()?.username) {
       const {
         id: s,
