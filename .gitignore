@@ -2,3 +2,11 @@
 # local-only docs (never commit)
 HANDOFF_THREAD_ID_AND_BAN_RISK.md
 ACCOUNT_SAFETY_GUIDE.md
+REACHABILITY_REVIEW_2026-09-04.md
+MANUAL_TEST_INVITE_LIMIT.md
+LOGIN_HANG_REVIEW_2026-09-04.md
+TAB_CLOSURE_REVIEW_2026-09-04.md
+THROTTLE_TEARDOWN_FIX_2026-09-04.md
+
+# throwaway harnesses and extracted source slices (never commit, never package)
+TEMP_*
