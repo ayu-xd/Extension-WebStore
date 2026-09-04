@@ -19,6 +19,13 @@ let state = {
   taskSettlers: {},
   mainTabId: null,
   additionalTabId: null,
+  // ADDL-GUARD-01: timestamp until which a dispatch into the additional tab is
+  // considered in flight (set by sendTaskToContent for the "additional" tab,
+  // generous grace because a slow reply is better than a killed one).
+  // closeAdditionalTab defers while this is live, so a main-tab failure can no
+  // longer kill a unibox reply / followup handoff mid-send — the "message
+  // channel closed" deaths in the 2026-09-04 bundles were exactly this race.
+  additionalInFlightUntil: 0,
   lastTaskCompletedAt: 0,
   emptyPollCount: 0
 };
@@ -371,6 +378,19 @@ async function refreshAccessTokenSingleFlight() {
 // ---------------------------------------------------------------------------
 
 async function init() {
+  // Migration (v1.4.8): rate-limit cooldowns were removed for ColdDMs parity, but
+  // an install updating from <=1.4.7 may still carry { enginePaused: true,
+  // enginePausedUntil: <future> } written by a cooldown. The auto-resume that
+  // cleared it is gone, so without this the engine stays paused forever. The
+  // presence of enginePausedUntil is proof the pause was a cooldown — the popup
+  // toggle always removed it — so clearing both keys is safe and never un-pauses
+  // a pause the user chose.
+  const stale = await chrome.storage.local.get('enginePausedUntil');
+  if (stale.enginePausedUntil) {
+    await chrome.storage.local.remove(['enginePaused', 'enginePausedUntil']);
+    debugLog("[Init] Cleared a stale rate-limit cooldown from a pre-1.4.8 build.");
+  }
+
   const data = await chrome.storage.local.get(['accessToken', 'refreshToken', 'browserId', 'browserLabel', 'instanceKey', 'stats', 'mainTabId', 'additionalTabId', 'enginePaused', 'disconnectedByUser']);
   if (data.accessToken) state.accessToken = data.accessToken;
   if (data.refreshToken) state.refreshToken = data.refreshToken;
@@ -390,7 +410,7 @@ async function init() {
     sendHeartbeat(true).catch(() => { });
   }
 
-  if (data.enginePaused) {
+  if (await isEnginePaused(data)) {
     debugLog("[Init] Engine is paused, skipping task engine auto-start.");
     return;
   }
@@ -606,7 +626,7 @@ async function _autoPairBrowserInner() {
     // Respect the pause switch — pairing links the browser, it must NOT
     // silently un-pause a paused engine (log showed pair→startEngine fights).
     const pauseState = await chrome.storage.local.get('enginePaused');
-    if (pauseState.enginePaused) {
+    if (await isEnginePaused(pauseState)) {
       debugLog("[Pair] Linked, but engine stays paused by user.");
     } else {
       startEngine();
@@ -696,7 +716,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     // restart the engine now. This recovers from the "engine dead" gap.
     if (state.browserId && state.accessToken) {
       const paused = await chrome.storage.local.get('enginePaused');
-      if (!paused.enginePaused) {
+      if (!await isEnginePaused(paused)) {
         const pollAlarm = await chrome.alarms.get('engine_poll');
         if (!pollAlarm) {
           debugLog("[Self-Heal] engine_poll alarm missing but browser is active — restarting engine.");
@@ -728,7 +748,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 async function collectMessagesJob() {
   if (!state.browserId || state.isProcessing) return;
   const pauseData = await chrome.storage.local.get('enginePaused');
-  if (pauseData.enginePaused) return;
+  if (await isEnginePaused(pauseData)) return;
   if (!state.mainTabId) return;
 
   if (state.lastTaskCompletedAt && Date.now() - state.lastTaskCompletedAt < 60000) {
@@ -837,7 +857,15 @@ async function pollUniboxReplies() {
       );
 
       if (!res?.success) {
-        throw new Error(res?.error?.error || "content script reported failure");
+        // UNIBOX-LIE companion fix: carry the content script's error TYPE
+        // through, not just the prose — the catch below needs it to tell a
+        // terminal verdict (unreachable / dead handle: never retry, Instagram
+        // already refused twice would just burn two 45 s cycles) from a
+        // transient one.
+        const _ct = res?.error?.type || null;
+        const _ce = new Error(res?.error?.error || "content script reported failure");
+        if (_ct) _ce.errorType = _ct;
+        throw _ce;
       }
 
       // ── DELIVERED ── The composer contract confirmed the physical send.
@@ -916,6 +944,12 @@ async function pollUniboxReplies() {
       const permanent =
         err?.permanent ||
         err?.errorType === "user_does_not_accept_dms" ||
+        // UNIBOX-LIE companion fix: the content script's typed verdicts are
+        // terminal — Instagram itself refused this recipient (unreachable
+        // thread, dead handle). Retrying 45 s later cannot un-refuse a lead;
+        // it only burns cycles and re-hammers the thread.
+        err?.errorType === "user_is_unreachable" ||
+        err?.errorType === "user_not_found" ||
         /not found|does not allow|no thread id|handle missing/i.test(msg);
       const attempts = Number(rt.retry_count || 0);
       if (!permanent && attempts < 2) {
@@ -1361,6 +1395,23 @@ async function setWake(reason, wakeMs, meta = {}) {
   });
 }
 
+// `enginePaused` has exactly one author: the user's popup toggle. It is STICKY —
+// it means "stop", and only the user may undo it.
+//
+// ColdDMs parity note: upstream has NO rate-limit pausing at all. Its isLimited
+// flag is written to the task row on the server (Colddms Latest/background.js:5895,
+// :6065) and nothing client-side ever pauses the engine over it. Every cooldown
+// mechanism here was our own invention (PACING-01/THROTTLE-*), and on this account
+// the only thing that ever triggered it was the profile API we already removed
+// (5 calls, 5 x 429, 0 verdicts) — a 30-minute outage per unfindable handle, self
+// inflicted. Removed: pauseEngineForCooldown, enginePausedUntil, the auto-resume,
+// and both call sites. is_limited is still recorded on the task row exactly as
+// upstream records it, so the data survives; only the pausing is gone.
+async function isEnginePaused(prefetched) {
+  const data = prefetched || await chrome.storage.local.get('enginePaused');
+  return !!data.enginePaused;
+}
+
 async function sendHeartbeat(force = false) {
   if (!state.browserId) return;
   try {
@@ -1488,9 +1539,10 @@ async function pollTasks() {
   state.processingLockAcquiredAt = Date.now();
 
   try {
-    // Check if engine is paused by user
+    // Check if the engine is paused by the user. The only author of this flag is
+    // the popup toggle — rate-limit cooldowns were removed for ColdDMs parity.
     const pauseData = await chrome.storage.local.get('enginePaused');
-    if (pauseData.enginePaused) {
+    if (await isEnginePaused(pauseData)) {
       debugLog(`[Poll] Engine paused by user, skipping.`);
       return;
     }
@@ -1579,20 +1631,9 @@ async function pollTasks() {
       const result = await executeTask(task);
       dlog("task_execute_done", { taskId: task.id, taskType: task.task_type, elapsedMs: Date.now() - taskStartedAt });
 
-      if (result?.isLimited) {
-        debugLog("[Pacing] Rate limit detected from content script! Pausing engine to prevent ban.");
-        await chrome.storage.local.set({ enginePaused: true });
-        // Auto-resume after a fixed 30 min cooldown.
-        setTimeout(() => {
-          chrome.storage.local.get('enginePaused', async (data) => {
-            if (data.enginePaused) {
-              await chrome.storage.local.remove('enginePaused');
-              debugLog("[Pacing] Auto-resuming after rate-limit cooldown.");
-            }
-          });
-        }, 30 * 60 * 1000);
-      }
-
+      // ColdDMs parity: isLimited is recorded on the task row (executeTask's
+      // success payloads carry is_limited) and nothing pauses over it — the
+      // engine keeps running exactly as upstream does.
       if (result?.skippedReply) {
         await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
           status: "skipped",
@@ -1640,10 +1681,35 @@ async function pollTasks() {
       }
     } catch (err) {
       console.error("Task failed:", err);
-      // F4: type-based classification. retryClass = genuine reachability type
-      // first, else the thrown ExtensionError type; contact-marking below keys
-      // ONLY on the genuine unreachableType.
-      const retryClass = err.unreachableType || err.errorType || null;
+      // TEARDOWN-01: two different questions are being asked here, and folding them
+      // into one variable is what broke the teardown ladder in v1.4.5.
+      //
+      //   retryClass — the DECISION key, and always the ExtensionError type. Every
+      //     consumer downstream compares it against CLASS names: the ladder's
+      //     user_is_unreachable exemption (:1680), isDeliveryUnknown (:1662),
+      //     isPermanentError, RETRY_CEILING, and TAB_HEALTHY_FAILURE_CLASSES. The
+      //     old order (`err.unreachableType || err.errorType`) let Instagram's raw
+      //     enum shadow the class, so on a genuinely unreachable lead retryClass was
+      //     "UNREACHABLE_USER_TYPE" and not one of those five comparisons could
+      //     match — the tab was destroyed and three attempts were burned on a lead
+      //     that had already said no. Upstream ColdDMs keeps the two in separate
+      //     parameters and tests only errorType (Colddms Latest/background.js:6214);
+      //     this restores that separation.
+      //   copyClass — the PROSE key, and nothing else. TASK_FAILURE_COPY carries
+      //     per-enum customer sentences that the generic class name would flatten,
+      //     so the sentence still prefers the enum. It decides no control flow.
+      //
+      // THROTTLE-02: normalise the name BEFORE either lane reads it. dom.js types a
+      // 429 as "rate_limited" and background has only ever tested for
+      // "rate_limited_error", and there are four separate content.js routes that can
+      // surface a throttled profile lookup (:653 checkResponse, :830 and :1482 on the
+      // send path, :1535 the dead-handle tiebreak). Fixing them one call site at a
+      // time is how a route gets missed, so the mapping lives here at the single
+      // point where every failure class is turned into a decision.
+      const errorTypeRaw = err.errorType || null;
+      const errorTypeClass = FAILURE_CLASS_ALIASES[errorTypeRaw] || errorTypeRaw;
+      const retryClass = errorTypeClass || err.unreachableType || null;
+      const copyClass = err.unreachableType || errorTypeClass || null;
       const isThreadBusy = err.errorType === "thread_busy" || err.message?.includes("thread is busy");
       // A content-script timeout happens after the task was dispatched, so the
       // message may already be in Instagram. The same is true when Send was
@@ -1670,10 +1736,19 @@ async function pollTasks() {
       // with. Upstream destroys the tab on EVERY error except user_is_unreachable,
       // because a destroyed content script cannot stay busy.
       //   user_is_unreachable    -> leave the tab alone (expected outcome, tab is fine)
+      //   rate_limited_error     -> leave the tab alone (see TEARDOWN-02 below)
       //   instagram_reload_error -> reload up to twice, then close (upstream's cap)
       //   anything else          -> close; next openTab creates a fresh pinned tab
-      if (retryClass === "user_is_unreachable") {
-        // Upstream's single exemption: nothing about the tab is suspect here.
+      //
+      // TEARDOWN-02: rate_limited_error joins the exemption because the doctrine is
+      // "close means the tab is sick". A 429 says nothing about the tab — the tab is
+      // healthy and Instagram is simply telling us to slow down. Closing it would
+      // make the next resume open a brand-new tab and pull a full Instagram page
+      // load moments after we were throttled, which is the opposite of what a
+      // pacing failure asks for. The engine pauses below instead.
+      if (TAB_HEALTHY_FAILURE_CLASSES.has(retryClass)) {
+        // Upstream's exemption: nothing about the tab is suspect here.
+        dlog("teardown_decision", { tier: "exempt", retryClass, errorType: err.errorType || null, tabId: state.mainTabId || null });
       } else if (retryClass === "instagram_reload_error") {
         const rc = Number((await chrome.storage.local.get('reloadCounter')).reloadCounter || 0);
         let reloaded = false;
@@ -1683,12 +1758,15 @@ async function pollTasks() {
         }
         if (reloaded) {
           await chrome.storage.local.set({ reloadCounter: rc + 1 });
+          dlog("teardown_decision", { tier: "reload", retryClass, errorType: err.errorType || null, tabId: state.mainTabId || null, reloadCounter: rc + 1 });
           dlog("tab_reloaded_after_failure", { tabId: state.mainTabId, retryClass, reloadCounter: rc + 1 }, "warn");
         } else {
+          dlog("teardown_decision", { tier: "close", retryClass, errorType: err.errorType || null, tabId: state.mainTabId || null, reloadCounter: rc, cause: "reload_cap_or_no_tab" });
           await closeMainTab(`instagram_reload_error after ${rc} reload attempts`);
           await chrome.storage.local.set({ reloadCounter: 0 });
         }
       } else {
+        dlog("teardown_decision", { tier: "close", retryClass, errorType: err.errorType || null, unreachableType: err.unreachableType || null, tabId: state.mainTabId || null, cause: "unclassified" });
         await closeMainTab(retryClass || "unclassified task failure");
       }
 
@@ -1707,14 +1785,35 @@ async function pollTasks() {
         debugLog(`[Safety] Task ${task.id} reached an unknown delivery state; it will not be auto-retried.`);
         dlog("task_delivery_unknown", { taskId: task.id, taskType: task.task_type, retryClass }, "warn");
       } else if (isThreadBusy) {
-        await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "pending" });
-        debugLog(`[Recovery] Task ${task.task_type} re-queued as pending (thread was busy) — backing off 60 s`);
-        dlog("task_requeued_busy", { taskId: task.id }, "warn");
-        // Back off 60 s before next poll. Without this the 15 s alarm immediately
-        // re-claims the same task into a still-busy tab, producing the thread_busy
-        // hammer loop. This is a safety net for any edge-case where thread_busy still
-        // surfaces; the primary fix is now the throw in content.js isBusy guards.
-        await setWake('busy_backoff', Date.now() + 60_000);
+        // BUSY-REQUEUE-01: this used to PATCH only {status:"pending"} — no
+        // retry_count — so a wedged tab (isBusy stuck true) produced an
+        // INFINITE requeue loop: the 2026-09-03 bundle shows two tasks
+        // ping-ponging claimed→busy→requeued for 12+ hours, every claim
+        // reporting retryCount:0. Now the attempt is counted, the backoff
+        // doubles (60s→2m→4m→8m→15m), and after 5 the task fails as
+        // transient_busy instead of looping forever. Busy means another task
+        // may be LIVE in that tab — the teardown ladder never closes on it —
+        // so a bounded wait is the only safe response.
+        const busyAttempts = Number(task.retry_count || 0) + 1;
+        if (busyAttempts > 5) {
+          await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
+            status: "failed",
+            error_reason: "The Instagram tab stayed busy with another send for over 20 minutes, so this send was stopped. Nothing was sent — the lead stays in your queue for the next run."
+          });
+          state.stats.failed++;
+          debugLog(`[Recovery] Task ${task.id} re-queued as busy 5 times — giving up.`);
+          dlog("task_busy_gave_up", { taskId: task.id, taskType: task.task_type }, "warn");
+        } else {
+          const busyBackoffMs = Math.min(60_000 * 2 ** (busyAttempts - 1), 15 * 60_000);
+          await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
+            status: "pending",
+            retry_count: busyAttempts,
+            error_reason: `The Instagram tab was busy with another send, so this one is waiting ${Math.round(busyBackoffMs / 60000)} min before trying again.`
+          });
+          debugLog(`[Recovery] Task ${task.task_type} re-queued as pending (thread was busy, attempt ${busyAttempts}/5) — backing off ${Math.round(busyBackoffMs / 60000)} s`);
+          dlog("task_requeued_busy", { taskId: task.id, attempt: busyAttempts, backoffMs: busyBackoffMs }, "warn");
+          await setWake('busy_backoff', Date.now() + busyBackoffMs);
+        }
       } else {
         const isPermanentError = [
           "user_is_unreachable",
@@ -1752,7 +1851,7 @@ async function pollTasks() {
             // CHURN-02: was `[Attempt 1/3] <raw bridge message>`. The raw message is
             // still captured in the local diagnostics ring (dlog task_failed above),
             // which is where we debug from; the DB column is what the customer reads.
-            error_reason: failureCopy(retryClass, { willRetry: true, attempt: nextRetry, maxRetries })
+            error_reason: failureCopy(copyClass, { willRetry: true, attempt: nextRetry, maxRetries })
           });
 
           const wakeUpAt = Date.now() + 30000;
@@ -1765,7 +1864,7 @@ async function pollTasks() {
           const recordedType = unreachableTypeFor(err, retryClass);
           await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
             status: "failed",
-            error_reason: failureCopy(retryClass, {
+            error_reason: failureCopy(copyClass, {
               attempt: currentRetries + 1,
               maxRetries,
               exhausted: currentRetries >= maxRetries,
@@ -1774,33 +1873,82 @@ async function pollTasks() {
             unreachable_type: recordedType
           });
 
-          if (retryClass === "rate_limited_error") {
-            debugLog("[Pacing] Rate limit error detected! Pausing engine to prevent ban.");
-            await chrome.storage.local.set({ enginePaused: true });
-          } else if ((err.unreachableType || retryClass === "user_not_found" || retryClass === "search_missing_unproven") && task.contact_id) {
-            // user_not_found included (F11): a 404'd handle is dead forever —
-            // park the contact so future campaigns never claim it again.
-            // search_missing_unproven added (P7): IG's own DM search came back
-            // empty on two separate fresh tabs and the profile API never gave an
-            // answer either time. That is the best evidence obtainable, so park.
-            // search_missing_alive is deliberately NOT in this list: there the API
-            // positively resolved the account, so the search index is what is
-            // wrong, and the contact stays claimable by a later campaign instead
-            // of being discarded on the strength of a stale index.
-            // The park is best-effort. contacts.status is CHECK-constrained
-            // server-side and the checked-in schema dump does not list
-            // 'unreachable' among the allowed values, so this PATCH can 400 on a
-            // database whose constraint was never widened. Until CHURN-04 the park
-            // was the last statement in this branch, so a rejection cost nothing;
-            // now the retire below is what actually keeps the dead lead out of the
-            // queue, and it must not be skipped because the park was refused.
-            try {
-              await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
-                status: "unreachable"
-              });
-            } catch (parkErr) {
-              dlog("contact_park_failed", { contactId: task.contact_id, retryClass, reason: parkErr?.message }, "warn");
-              debugLog(`[Collector] Could not park contact ${task.contact_id} as unreachable: ${parkErr?.message}. Retiring its queued tasks anyway.`);
+          // rate_limited_error deliberately falls through to the generic
+          // else-if chain now: it is in isPermanentError (task row already
+          // failed above with its own copy), the tab is exempt (TAB_HEALTHY_
+          // FAILURE_CLASSES), and ColdDMs parity says a rate limit never
+          // parks a lead and never pauses the engine — isLimited is only
+          // ever recorded on the row, exactly as upstream does
+          // (Colddms Latest/background.js:5895, :6065). The profile API that
+          // produced every recorded 429 here is gone anyway (P9).
+          if ((recordedType || retryClass === "search_missing_unproven") && task.contact_id) {
+            // CHURN-05: the park and the retire are two different decisions now,
+            // because their blast radii are nothing alike.
+            //
+            // CHURN-06: this condition reads `recordedType` — the value persisted to
+            // the row above — instead of the raw `err.unreachableType` it used to
+            // test. The two disagree in exactly one case, and that case is live:
+            // when the borrowed enum lookup finds nothing, content.js:1112 emits
+            // `unreachableType: undefined`, so the raw field is empty while
+            // unreachableTypeFor() still resolves the class itself and stamps
+            // unreachable_type = 'user_is_unreachable' on the task. The old test then
+            // concluded there was nothing to clean up, on a row it had just labelled
+            // unreachable. Reading the value we saved makes the record and the
+            // cleanup agree. It cannot widen the park — that is nested under
+            // retryClass === 'user_not_found' below — only the same-day retire.
+            //
+            // PARK (contacts.status = 'unreachable') is a one-way door. The
+            // scheduler builds both candidate sets from contacts.status, both
+            // cross-account RPCs filter on `c.status <> 'unreachable'`, and no UI
+            // surface writes the status back — Actions.tsx's removeDmTask needs a
+            // live task row, which a parked lead by definition never has. So it
+            // now fires on user_not_found ONLY. Three things in dom.js produce that
+            // class, and each is terminal on its own terms:
+            //   • dom.js:930 — the handle fails IG's own charset ^[A-Za-z0-9._]+$.
+            //     No network involved; the handle cannot exist as typed.
+            //   • dom.js:947 — HTTP 404 from /api/v1/users/web_profile_info/.
+            //     Proof from the server.
+            //   • dom.js:961-979 — HTTP 200, an envelope shape we RECOGNISE, and an
+            //     empty user slot. An unrecognised envelope deliberately falls back
+            //     to the non-terminal profile_lookup_failed instead (P6 SAFETY),
+            //     which is what makes narrowing the park onto this class safe.
+            //
+            // Deliberately no longer parking on:
+            //   • err.unreachableType — the 12 names it can carry are read out of
+            //     a borrowed numeric enum table (content.js:937-948) that we did
+            //     not write, cannot verify, and now know to be incomplete: a live
+            //     Relay dump shows a thread-level reachability_status of
+            //     UNREACHABLE_INVITE_LIMIT_REACHED, which appears nowhere in that
+            //     table. Worse, some names it does carry describe OUR account
+            //     rather than the lead — UNREACHABLE_MR_LIMIT_BLOCK is our own
+            //     message-request cap. Retiring a live lead forever because we hit
+            //     a cap is the worst outcome on the table. The value is still
+            //     recorded on the task row above, where it is diagnostics rather
+            //     than a verdict.
+            //   • search_missing_unproven — IG's DM search came back empty on two
+            //     fresh tabs, and since P9 nothing else is consulted afterwards. So
+            //     this is absence of evidence off the flakiest surface we read:
+            //     strong, but never proof. It still clears today's queue below; it
+            //     no longer discards the lead.
+            //   • search_missing_alive stays excluded as before. A current content
+            //     script can no longer throw it — P9 removed the profile-API
+            //     tiebreak that produced it — but a tab still running the pre-P9
+            //     script can until it reloads, and there the API positively
+            //     resolved the account, so the index is what is stale.
+            if (retryClass === "user_not_found") {
+              // Best-effort. contacts.status is CHECK-constrained server-side and
+              // contacts_status_check does not list 'unreachable' until the
+              // widening migration runs, so this PATCH can 400. The retire below
+              // is what actually keeps the dead lead out of the queue and must not
+              // be skipped because the park was refused.
+              try {
+                await supabaseReq(`contacts?id=eq.${task.contact_id}`, "PATCH", {
+                  status: "unreachable"
+                });
+              } catch (parkErr) {
+                dlog("contact_park_failed", { contactId: task.contact_id, retryClass, reason: parkErr?.message }, "warn");
+                debugLog(`[Collector] Could not park contact ${task.contact_id} as unreachable: ${parkErr?.message}. Retiring its queued tasks anyway.`);
+              }
             }
 
             // CHURN-04: the park above only stops the *next* generation cycle.
@@ -1811,9 +1959,19 @@ async function pollTasks() {
             // handle we just proved dead comes back around and fails again. Retiring
             // them here, in the same beat as the park, is what actually keeps a bad
             // lead out of the queue.
+            //
+            // It still runs for every class in the branch condition, parked or not.
+            // For an unparked lead that makes it a same-day measure: it clears the
+            // rows already queued for today so one bad handle cannot be hammered
+            // all day, and tomorrow's cycle regenerates normally because the
+            // contact's status was never touched. The copy has to say which of the
+            // two happened, or the customer reads "set aside" on a lead that walks
+            // straight back into the queue.
             await retirePendingTasksForContact(
               task.contact_id,
-              "Skipped — this lead was set aside because Instagram can't deliver to their account."
+              retryClass === "user_not_found"
+                ? "Skipped — this lead was set aside because Instagram can't deliver to their account."
+                : "Skipped — Instagram wouldn't deliver to this lead on this attempt, so we cleared their remaining sends for today. They stay in the campaign and we'll try again on the next run."
             );
           }
 
@@ -1931,7 +2089,7 @@ const TASK_FAILURE_COPY = {
   banned_error: "Instagram has restricted your account's messaging, so we stopped to keep it safe. Nothing was sent — try again once the restriction lifts.",
   rate_limited_error: "Instagram rate-limited your account, so we stopped to keep it safe. Nothing was sent — this lead stays in the queue.",
   search_missing_alive: "This account exists but didn't come up in Instagram's DM search, so we couldn't open the chat. Nothing was sent — the lead stays in your queue.",
-  search_missing_unproven: "This handle didn't come up in Instagram's DM search and we couldn't confirm the account still exists. Nothing was sent.",
+  search_missing_unproven: "Instagram's DM search couldn't find this handle, so we couldn't open the chat. Nothing was sent — the lead stays in your queue.",
   thread_not_found: "Instagram didn't return the conversation for this lead, so we couldn't read or continue it. Nothing was sent.",
   thread_busy: "Another send was already in progress in this conversation, so we skipped this one to avoid a duplicate DM.",
   composer_empty_error: "Instagram cleared the message box before we could send, so nothing went out.",
@@ -1978,10 +2136,12 @@ function failureCopy(retryClass, { willRetry = false, attempt = 0, maxRetries = 
 // ExtensionError types below. No new vocabulary is coined.
 //
 // search_missing_alive and search_missing_unproven are deliberately NOT here.
-// "alive" means the API positively resolved the account, so calling it
-// unreachable would be a lie; "unproven" means the API couldn't tell us either
-// way, and quietly hiding a failure we can't prove is how a dashboard stops being
-// trustworthy. Both keep their honest red row.
+// "unproven" means IG's DM search came back empty and, since P9, nothing else was
+// asked — quietly hiding a failure we cannot prove is how a dashboard stops being
+// trustworthy. "alive" can no longer be thrown by a current content script (P9
+// removed the profile-API tiebreak that produced it) but stays mapped for the
+// update window, because a tab still running the old script can raise it until it
+// reloads. Both keep their honest red row.
 //
 // Only two entries, and both are types something actually throws:
 // content.js:800/:1563 throw user_not_found, content.js:2214 and the two dialog
@@ -1994,6 +2154,31 @@ const PROVEN_UNREACHABLE_CLASSES = new Set([
   "user_not_found",
   "user_is_unreachable"
 ]);
+
+// TEARDOWN-02: failure classes that say nothing bad about the Instagram tab, so the
+// teardown ladder leaves it open. Keep this list short — the default must stay
+// "close the tab", because a stale content script with isBusy still set is what the
+// next task collides with. Membership requires a positive reason to trust the tab:
+//   user_is_unreachable — Instagram answered us; the lead simply cannot be messaged.
+//   rate_limited_error  — Instagram answered us; it wants fewer requests, not a new tab.
+const TAB_HEALTHY_FAILURE_CLASSES = new Set([
+  "user_is_unreachable",
+  "rate_limited_error"
+]);
+
+// THROTTLE-02: dom.js and background.js grew two spellings for the same failure.
+// dom.js:948 names a 429 "rate_limited"; every decision in this file — the pacing
+// pause, isPermanentError, TAB_HEALTHY_FAILURE_CLASSES, TASK_FAILURE_COPY — was
+// written against "rate_limited_error". Nothing bridged them, so a throttled
+// profile lookup fell through as an unclassified failure: the tab was destroyed,
+// three attempts were spent, the engine never paused, and on the dead-handle
+// tiebreak route the lead was parked as unreachable on the strength of a throttle.
+// Alias the vocabulary here rather than at each thrower, so a future route that
+// emits the dom.js name is covered the day it is written. The raw name is still
+// logged verbatim by dlog("task_failed") for diagnostics.
+const FAILURE_CLASS_ALIASES = {
+  rate_limited: "rate_limited_error"
+};
 
 function unreachableTypeFor(err, retryClass) {
   if (err?.unreachableType) return err.unreachableType;
@@ -2726,6 +2911,15 @@ async function openTab(type, targetUrl = null) {
 // null-then-remove order as closeMainTab, for the same reason.
 async function closeAdditionalTab(reason) {
   if (!state.additionalTabId) return;
+  // ADDL-GUARD-01: a send is live in this tab (unibox reply / followup
+  // handoff). Closing it now kills the dispatch mid-flight — the exact
+  // "message channel closed" failures in the 2026-09-04 bundles. Defer: the
+  // owning flow's own error handling closes the tab when it unwinds, and
+  // openTab's bad-load/reload logic cleans up on the next cycle either way.
+  if (Date.now() < state.additionalInFlightUntil) {
+    dlog("additional_tab_close_deferred", { tabId: state.additionalTabId, reason: reason || null, inFlightForMs: state.additionalInFlightUntil - Date.now() }, "warn");
+    return;
+  }
   const tabId = state.additionalTabId;
   state.additionalTabId = null;
   await chrome.storage.local.remove('additionalTabId').catch(() => {});
@@ -2821,6 +3015,12 @@ async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) 
   }
 
   debugLog(`[sendTaskToContent] Sending actual task ${taskType} to tab ${tabId}...`);
+  // ADDL-GUARD-01: mark the additional tab as in flight for this dispatch.
+  // The mark is a timestamp, not a flag — it expires naturally after the grace
+  // window (11 min > the 10-min watchdog ceiling), so there is no finally to
+  // clear and no path that can leak it. A deferred close is harmless; a
+  // premature one kills a live reply.
+  if (tabType === "additional") state.additionalInFlightUntil = Date.now() + 11 * 60_000;
   try {
     const response = await chrome.tabs.sendMessage(tabId, {
       type: "adblock:info:to-content",
