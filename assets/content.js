@@ -810,23 +810,24 @@ class Instagram {
               this.log({ type: "[sendMessage] Normalised lead handle", data: { from: _rawHandle, to: _cleanHandle, taskId: s } });
               e.username = _cleanHandle;
             }
-            // P7: there is no pre-flight existence check any more. F11 used to spend
-            // one web_profile_info call here on EVERY send, before any dialog work.
-            // Two things were wrong with that. It is pure waste on a successful send
-            // — every consumer of the result sat on a failure path, so a send that
-            // worked paid for an answer nobody read. And it made the borrowed API
-            // the first oracle even though IG's own DM search is the better one: in
-            // the 2026-09-03 production session the search box answered correctly
-            // 3 of 3 times (one hit for each live handle, zero for the dead one)
-            // while 3 of 3 web_profile_info calls came back 429.
+            // P7/P9: there is no existence check on this path at all any more —
+            // neither the pre-flight F11 ran before any dialog work, nor the
+            // tiebreak P7 replaced it with once the dialog came back empty.
             //
-            // The order is now inverted. Search first; if it finds the lead, no API
-            // call happens at all. The API is consulted only as a tiebreak, only
-            // after the dialog has already reported the handle missing — see
-            // _askApiIfHandleIsDead. This memo carries that one answer between the
-            // two places below that can reach the tiebreak, so a task spends one
-            // call, never two.
-            var _apiDeadCheck = {};
+            // F11's pre-flight was pure waste on a successful send: every consumer
+            // of the result sat on a failure path, so a send that worked paid for an
+            // answer nobody read. P7 inverted the order — search first, ask the API
+            // only after a miss — which killed the waste but kept a borrowed
+            // endpoint as the judge of whether a lead exists.
+            //
+            // P9 removes the judge. Consulted 5 times on the whole record, it
+            // answered HTTP 429 five times and 404 zero times, and since THROTTLE-01
+            // every one of those 429s costs a 30-minute engine-wide cooldown we
+            // caused ourselves. An empty DM search is now classified on its own as
+            // search_missing_unproven — see _searchMissedError. Upstream ColdDMs
+            // never verified a handle either: its single web_profile_info call
+            // (Colddms Latest/assets/dom.js:663) exists to fetch user.id and
+            // followed_by_viewer so a thread can be opened, never to form a verdict.
             if (r) l = await this.domConnector.send("getUserByUsername", {
               username: e.username
             }), this.log({
@@ -863,19 +864,17 @@ class Instagram {
                 } catch (_dialogThrowErr) {
                   this.log({ type: "[Followup] findUserInDialogWithoutClick threw — treating as null threadId", data: { username: e.username, taskId: s, error: describeBridgeError(_dialogThrowErr), errorType: _dialogThrowErr?.type ?? null } });
                   h = null;
-                  // P7: the dialog looked and found nothing. Ask the profile API
-                  // once (memoised) and act only on a clean 404: that handle does
-                  // not exist, so falling through would run a SECOND full dialog
-                  // search — ~60s more — for an account that is not there, then
-                  // surface user_click_error, which the retry engine repeats three
-                  // more times. Any other answer DOES fall through, because
-                  // openUser searches differently — it re-primes the box with an
-                  // "instagra" cache-buster between its two tries — and regularly
-                  // finds leads this scrape missed.
-                  if (_dialogThrowErr?.type === "user_click_error") {
-                    const _v = await this._askApiIfHandleIsDead(e.username, _apiDeadCheck, s);
-                    if (_v === "dead") throw this._missingUserError(_v, e.username);
-                  }
+                  // P9: no API tiebreak here — every throw from this scrape now
+                  // falls through to openUser below, which was already the right
+                  // behaviour for three of the tiebreak's four verdicts. openUser
+                  // searches differently (it re-primes the box with an "instagra"
+                  // cache-buster between its two tries) and regularly finds leads
+                  // this scrape missed, so a failed scrape says nothing about the
+                  // lead. This was also the tiebreak's worst placement: a 429
+                  // verdict here did NOT bail — only "dead" did — so the memoised
+                  // throttle sat unread while the task ran a second full ~42s
+                  // search before surfacing rate_limited_error anyway
+                  // (2026-09-04 v1.4.6 bundle, elapsedMs 120323).
                 }
                 var _liveThreadId = h?.candidate?.id ?? null;
                 this.log({ type: "[Followup] Live thread id scraped from search results", data: { username: e.username, taskId: s, threadId: _liveThreadId, matched: !!h?.candidate } });
@@ -915,18 +914,21 @@ class Instagram {
                   type: "[sendMessage] Dialog open failed",
                   data: { username: e.username, error: describeBridgeError(_dialogErr), errorType: _dt }
                 });
-                // P7: only user_click_error is evidence about the PERSON. It is
-                // reachable solely after the modal opened, the handle was typed
-                // twice with an "instagra" cache-buster between the tries, and
-                // ~20 result polls came back empty (dom.js:456). The other types
-                // are evidence about the DIALOG — open_search_popup_error means
-                // the modal never opened, user_search_error means the query could
-                // not be typed, a timeout means neither happened in time. None of
-                // those say anything about whether the lead exists, so they keep
-                // their transient classification and their full retry budget.
+                // P7: only user_click_error is evidence that the SEARCH found
+                // nothing. It is reachable solely after the modal opened, the
+                // handle was typed twice with an "instagra" cache-buster between
+                // the tries, and ~20 result polls came back empty (dom.js:456).
+                // The other types are evidence about the DIALOG —
+                // open_search_popup_error means the modal never opened,
+                // user_search_error means the query could not be typed, a timeout
+                // means neither happened in time. None of those say anything about
+                // the lead, so they keep their transient classification and their
+                // full retry budget.
                 if (_dt !== "user_click_error") throw _dialogErr;
-                const _verdict = await this._askApiIfHandleIsDead(e.username, _apiDeadCheck, s);
-                throw this._missingUserError(_verdict, e.username);
+                // P9: end of the road for this handle today, and it is classified
+                // without a network call. No second search, no borrowed verdict,
+                // no park.
+                throw this._searchMissedError(e.username);
               }
               this.log({ type: "User opened", data: {} });
             } else this.log({
@@ -1172,12 +1174,11 @@ class Instagram {
           // slip in while the pre-flight call below is in flight. The finally
           // block resets it if we throw.
           this.isBusy = !0, this.taskId = s, this._checkIfUserReceivedBlockMessage();
-          // P7: no pre-flight here either — same reasoning as the main-tab route.
-          // The additional tab is the followup path, so the lead has already been
-          // messaged successfully at least once; spending a web_profile_info call
-          // to re-ask whether they exist, before the dialog has complained about
-          // anything, was the least justified of the two. Memo for the tiebreak.
-          var _pfDeadCheck = {};
+          // P7/P9: no existence check here either — the same reasoning as the
+          // main-tab route, only stronger. The additional tab is the followup path,
+          // so this lead has already been messaged successfully at least once;
+          // asking a borrowed endpoint whether they exist was the least justified
+          // call in the extension.
           if (await this.domConnector.send("preTaskHooks", {}), await this.sleep(5e3), await this._checkIfOpenUserRequired({
               username: e.username
             })) {
@@ -1194,17 +1195,14 @@ class Instagram {
             } catch (openErr) {
               const _ot = openErr?.type ?? null;
               this.log({ type: "[Followup] openUser failed", data: { username: e.username, error: describeBridgeError(openErr), errorType: _ot } });
-              // P7: same split as the main-tab route — user_click_error is the only
-              // type that means IG's search looked and found nothing, so it is the
-              // only one that earns an API tiebreak. Everything else falls through
-              // to the _checkIfOpenUserRequired self-recovery check below, exactly
-              // as before, because the thread may well have opened anyway.
+              // P7/P9: the same split as the main-tab route — user_click_error is
+              // the only type that means IG's search looked and found nothing, so
+              // it is the only one that ends the task. Everything else falls
+              // through to the _checkIfOpenUserRequired self-recovery check below,
+              // exactly as before, because the thread may well have opened anyway.
               // The profile-route fallback that used to sit here is gone: 0 of 8
               // recorded attempts ever succeeded.
-              if (_ot === "user_click_error") {
-                const _verdict = await this._askApiIfHandleIsDead(e.username, _pfDeadCheck, s);
-                throw this._missingUserError(_verdict, e.username);
-              }
+              if (_ot === "user_click_error") throw this._searchMissedError(e.username);
             }
             if (await this._checkIfOpenUserRequired({ username: e.username })) {
               // Hard failure after self-recovery attempt. THROW (not emit+return):
@@ -1299,14 +1297,23 @@ class Instagram {
                 additionalTab: !0
               }), !0
             }
-            this.backgroundConnector.emit("errorTask", {
-              error: "User is unreachable",
-              errorType: "user_is_unreachable",
-              unreachableType: o ? n[o.contact_reachability_status_type] : "UNKNOWN",
-              taskId: s,
-              taskType: "sendMessage",
-              additionalTab: !0
-            })
+            // UNIBOX-LIE: this used to emit errorTask and then RETURN NORMALLY,
+            // so processMessage wrapped the handler's result as {success:true}.
+            // Every response-reading caller believed the send worked — the
+            // 2026-09-04 bundle shows pollUniboxReplies marking a reply
+            // "delivered" to a thread whose reachability was 1 (UNREACHABLE_
+            // USER_TYPE): Instagram refused it, we reported success. Same fix
+            // as additional_tab_error below: THROW so the response is
+            // {success:false} AND the outer catch re-emits errorTask, making
+            // the response, the emit and the UI all agree. ExtensionError only
+            // carries {message,type}, so unreachableType is attached after
+            // construction for the catch's errorTask emit to forward.
+            const _unreachErr = new ExtensionError({
+              type: "user_is_unreachable",
+              message: "User is unreachable"
+            });
+            _unreachErr.unreachableType = o ? n[o.contact_reachability_status_type] : "UNKNOWN";
+            throw _unreachErr;
           }
         } catch (e) {
           throw await this.screenshot(), this.backgroundConnector.emit("errorTask", {
@@ -1428,10 +1435,12 @@ class Instagram {
     sinceMs: _sinceMs = null
   }) {
     var e = (await this.domConnector.send("getAllMessages", {}))[t];
-    // No thread in the ReStore (common on a freshly-opened tab that hasn't
-    // hydrated yet) → fall back to reading the live message rows from the DOM.
-    // Propagate sinceMs so the fallback can ignore anything older than it.
-    if (!e) {
+    // No thread in the store, OR a thread whose messages haven't hydrated yet
+    // (Relay threads can exist with 0 message edges before the page fetches
+    // them — treating that as "no reply" would skip the DOM fallback and could
+    // miss a real reply) → fall back to reading the live message rows from the
+    // DOM. Propagate sinceMs so the fallback can ignore anything older than it.
+    if (!e || !(e.messages || []).length) {
       this.log({ type: "[replyGuard] Store empty — reading live DOM rows instead", data: { username: t, sinceMs: _sinceMs } });
       const _domHit = await this.domConnector.send("checkResponseFromDOM", { sinceMs: _sinceMs });
       this.log({
@@ -1511,73 +1520,33 @@ class Instagram {
       attempt: s
     })
   }
-  // P7: the profile API is a tiebreak, not a gate. It is called only after IG's
-  // own DM search has already reported the handle missing, and its answer is
-  // memoised on `memo` so a task that reaches two different dialog failure points
-  // spends one call, not two. Replaces _deadHandleOrDialogError, which had to
-  // reason about a pre-flight that no longer happens. Returns:
-  //   "dead"    — clean 404 from web_profile_info; the account does not exist
-  //   "alive"   — the handle resolved to a real user id, so the search index is
-  //               the thing that is wrong, not the lead
-  //   "unknown" — 429 / auth / network / unparseable; no answer either way, so
-  //               IG's search box stays the best evidence we have
-  async _askApiIfHandleIsDead(username, memo, taskId) {
-    if (memo && memo.verdict) {
-      this.log({ type: "[deadCheck] Reusing memoised verdict — no second API call", data: { username, verdict: memo.verdict, taskId } });
-      return memo.verdict;
-    }
-    let verdict = "unknown";
-    try {
-      const u = await this.domConnector.send("getUserByUsername", { username });
-      verdict = u?.id ? "alive" : "unknown";
-      this.log({
-        type: verdict === "alive"
-          ? "[deadCheck] API resolved the handle — DM search is stale, not the lead"
-          : "[deadCheck] API answered without a user id — no verdict",
-        data: { username, userId: u?.id ?? null, taskId }
-      });
-    } catch (err) {
-      if (err?.type === "user_not_found") {
-        verdict = "dead";
-        this.log({ type: "[deadCheck] API returned 404 — handle is dead", data: { username, taskId } });
-      } else {
-        this.log({
-          type: "[deadCheck] API gave no usable answer — deferring to IG DM search",
-          data: { username, error: describeBridgeError(err), errorType: err?.type ?? null, statusCode: err?.statusCode ?? null, taskId }
-        });
-      }
-    }
-    if (memo) memo.verdict = verdict;
-    return verdict;
-  }
-  // P7: turn a tiebreak verdict into the error the retry engine acts on. The
-  // one-retry ceiling for the two search_missing_* classes lives in background.js
-  // (RETRY_CEILING) because the content script is never told the task's
-  // retry_count. Between retries the background already tears the tab down and
-  // the next claim opens a fresh one, so "reload the tab and try once more" needs
-  // no code here — capping the retry count IS that reload.
-  _missingUserError(verdict, username) {
-    if (verdict === "dead") {
-      this.log({ type: "[deadCheck] Verdict: dead handle — terminal, contact will be parked", data: { username } });
-      return new ExtensionError({
-        type: "user_not_found",
-        message: "Handle not found in IG DM search and 404 from the profile API — dead handle, no retries"
-      });
-    }
-    if (verdict === "alive") {
-      // The account demonstrably exists, so the contact must NOT be parked when
-      // the one retry runs out: a live lead IG's search cannot surface right now
-      // (index lag, a privacy setting) has to stay claimable by a later campaign.
-      this.log({ type: "[deadCheck] Verdict: alive but unsearchable — one retry on a fresh tab, contact NOT parked", data: { username } });
-      return new ExtensionError({
-        type: "search_missing_alive",
-        message: "Profile API confirms this account exists but IG DM search cannot find it — one retry on a fresh tab"
-      });
-    }
-    this.log({ type: "[deadCheck] Verdict: unproven — one retry on a fresh tab, then park", data: { username } });
+  // P9: an empty IG DM search, classified without asking anything else.
+  //
+  // What used to live here: _askApiIfHandleIsDead, which spent one
+  // web_profile_info call as a tiebreak once the search came back empty, and a
+  // four-way _missingUserError that turned its verdict into one of user_not_found
+  // (park the contact), search_missing_alive, rate_limited_error or
+  // search_missing_unproven. Both are gone. The record across every diagnostics
+  // bundle on disk: 5 consultations, 5 x HTTP 429, 0 x 404 — it never once
+  // produced the dead-handle verdict it was built to produce, and since
+  // THROTTLE-01 each of those 429s costs a 30-minute engine-wide cooldown that we
+  // triggered ourselves with a request nothing needed.
+  //
+  // So a search miss is now what it always was: absence of evidence off
+  // Instagram's flakiest surface. background.js gives this class one retry on a
+  // fresh tab (RETRY_CEILING, :1807), retires the contact's remaining tasks for
+  // today (:1856) — if IG cannot see the handle now, the followups queued behind
+  // it fail identically — and does NOT park (:1906 fires on user_not_found only).
+  //
+  // A genuinely dead handle is still detectable, on the two routes where the proof
+  // is free: the charset check in sendMessage (no network at all) and a 404 from
+  // one of the functional getUserByUsername calls we have to make anyway to open
+  // a thread. Neither is a request invented in order to form an opinion.
+  _searchMissedError(username) {
+    this.log({ type: "[searchMiss] IG DM search found nothing — one retry on a fresh tab, contact NOT parked", data: { username } });
     return new ExtensionError({
       type: "search_missing_unproven",
-      message: "IG DM search found nothing and the profile API gave no answer — one retry on a fresh tab"
+      message: "Instagram's DM search could not find this handle — nothing was sent, one retry on a fresh tab"
     });
   }
   async _checkIfOpenUserRequired({

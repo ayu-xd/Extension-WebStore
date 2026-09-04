@@ -1695,12 +1695,158 @@
         }
       }
       async _getAllMessages() {
+        // Relay first. IG has migrated DMs to the Slide stack: the ReStore tables
+        // _getAllMessagesUnsafe reads (messages/contacts/ig_contact_info/...) are
+        // empty on migrated accounts, so every read returned {} and callers burned
+        // their re-poll ladders waiting for hydration that could never arrive
+        // (2026-09-04 logs: 5×~12s per send on a live account while the thread sat
+        // fully-formed in the Relay store the whole time). Relay is also ~1000x
+        // cheaper — an in-memory toJSON() vs full ReQL table iterations.
+        // The ReStore path stays as the fallback for pre-cutover accounts; both
+        // return the same {username: {thread_key, messages[]}} shape.
+        try {
+          const relay = this._getAllMessagesFromRelay();
+          if (relay && Object.keys(relay).length > 0) return relay;
+          this.log({ type: "[Relay] 0 threads resolved — falling back to ReStore", data: {} });
+        } catch (e) {
+          this.log({ type: "[Relay] read failed — falling back to ReStore", data: { error: String(e?.message || e) } });
+        }
         try {
           return await this._getAllMessagesUnsafe();
         } catch (e) {
           return (console.warn("[ColdDMs] _getAllMessages: ReStore unavailable, returning empty", e), {});
         }
       }
+      // Locate the page's Relay environment via the React fiber tree. Cached; the
+      // cache is validated by touching getStore() so a torn-down env re-scans.
+      _getRelayEnv() {
+        if (this._relayEnvCache) {
+          try { this._relayEnvCache.getStore().getSource(); return this._relayEnvCache; } catch (e) { this._relayEnvCache = null; }
+        }
+        const isEnv = (v) => v && typeof v === "object" &&
+          typeof v.getStore === "function" &&
+          (typeof v.execute === "function" || v._network != null);
+        let rootFiber = null;
+        for (const el of document.querySelectorAll("*")) {
+          const fk = Object.keys(el).find((k) => k.startsWith("__reactFiber") || k.startsWith("__reactInternalInstance"));
+          if (fk) { rootFiber = el[fk]; break; }
+        }
+        if (!rootFiber) return null;
+        while (rootFiber.return) rootFiber = rootFiber.return;
+        const seen = new WeakSet();
+        const queue = [rootFiber];
+        while (queue.length) {
+          const f = queue.shift();
+          if (!f || seen.has(f)) continue;
+          seen.add(f);
+          const vals = [f.memoizedProps];
+          let h = f.memoizedState, n = 0;
+          while (h && n < 40) { if (h.memoizedState) vals.push(h.memoizedState); h = h.next; n++; }
+          for (const v of vals) {
+            if (!v || typeof v !== "object") continue;
+            if (isEnv(v)) { this._relayEnvCache = v; return v; }
+            if (isEnv(v.environment)) { this._relayEnvCache = v.environment; return v.environment; }
+          }
+          if (f.child) queue.push(f.child);
+          if (f.sibling) queue.push(f.sibling);
+        }
+        return null;
+      }
+      _getAllMessagesFromRelay() {
+        const env = this._getRelayEnv();
+        if (!env) return null;
+        let recs;
+        try { recs = env.getStore().getSource().toJSON(); } catch (e) {
+          this.log({ type: "[Relay] store read threw", data: { error: String(e) } });
+          return null;
+        }
+
+        const users = {}; const userByFbid = {};
+        let ownUsername = null;
+        const viewerRef = recs["client:root:viewer"]?.xdt_user?.__ref || null;
+        for (const [id, r] of Object.entries(recs)) {
+          if (r?.__typename !== "XDTUserDict") continue;
+          users[id] = r.username || null;
+          const fbid = r.interop_messaging_user_fbid ?? r.fbid_v2 ?? null;
+          if (fbid) userByFbid[String(fbid)] = r.username || null;
+        }
+        if (viewerRef) ownUsername = users[viewerRef] || null;
+
+        // The viewer's PARTICIPANT fbid (FBID space, NOT thread.viewer_id which is
+        // the IG id) rides the SlideMailbox record id; SlideMessage.sender_fbid and
+        // XFBSlideReadReceipt.participant_fbid live in the same space.
+        let ownFbid = null;
+        for (const id of Object.keys(recs)) {
+          if (id.startsWith("SlideMailbox:")) { ownFbid = id.slice("SlideMailbox:".length); break; }
+        }
+
+        const map = {};
+        for (const [id, r] of Object.entries(recs)) {
+          if (r?.__typename !== "XFBIGDirectViewerThread") continue;
+          const leadRef = r.users?.__refs?.[0] || "";
+          const leadUsername = users[leadRef];
+          if (!leadUsername) continue; // group threads / unresolved users — the legacy join skipped these too
+
+          // Merge every hydrated slide_messages connection and dedupe by node id:
+          // (first:20) can exist with 0 edges while (first:5) holds the preview rows.
+          const seenMsg = new Set();
+          const msgs = [];
+          for (const key of ["slide_messages(first:5)", "slide_messages(first:20)",
+                             "__IGDInbox__slide_messages_connection",
+                             "__IGDMessagesList_slide_messages_connection"]) {
+            const conn = recs[r[key]?.__ref || ""];
+            for (const eRef of conn?.edges?.__refs || []) {
+              const m = recs[recs[eRef]?.node?.__ref || ""];
+              if (!m || seenMsg.has(m.__id)) continue;
+              seenMsg.add(m.__id);
+              const outgoing = ownFbid != null && String(m.sender_fbid) === String(ownFbid);
+              msgs.push({
+                username: userByFbid[String(m.sender_fbid)] || (outgoing ? ownUsername : leadUsername),
+                senderId: m.sender_fbid ?? null,
+                timestampMs: m.timestamp_ms ?? null,
+                message_id: m.message_id || m.id || null,
+                text: m.text_body ?? null,
+                outgoing,
+                threadKey: r.thread_key ?? null,
+              });
+            }
+          }
+          msgs.sort((a, b) => Number(b.timestampMs) - Number(a.timestampMs));
+
+          map[leadUsername] = {
+            username: leadUsername,
+            instagram_id: String(leadRef).split(":")[1] || null,
+            // Reachability: the send gates (content.js:958/:1245/:2212) hard-block
+            // on anything outside ["0","3"], so this field MUST stay "0". The Relay
+            // thread's reachability_status describes the message-REQUEST state
+            // (e.g. UNREACHABLE_INVITE_LIMIT_REACHED = our own account hit its
+            // invite cap on NEW requests) — it does NOT govern replies/followups
+            // inside an established thread: 2026-09-04 live proof, a reply to
+            // @tbordona delivered successfully while her entry carried the same
+            // capped status. Translating it to a blocking number made the gates
+            // permanently fail unibox REPLIES to leads who had just messaged us.
+            // The gates only ever see this map when the thread already exists —
+            // i.e. an ongoing conversation — so fail-open is always correct here,
+            // and genuine send failures surface at send time. The raw Relay value
+            // is kept on relay_reachability_status for diagnostics only; CHURN-05
+            // guarantees it can never park a lead.
+            contact_reachability_status_type: "0",
+            relay_reachability_status: r.reachability_status ?? null,
+            thread_key: r.thread_key ?? null,
+            thread_fbid: r.thread_fbid ?? null,
+            folder: r.folder ?? r.messaging_folder_tag ?? null,
+            lastActivityAt: r.last_activity_timestamp_ms ?? null,
+            messages: msgs,
+          };
+        }
+        return map;
+      }
+      // NOTE: deliberately NO reachability translation helper here. An earlier
+      // version mapped the Relay enum into the gates' numeric domain, with
+      // unknown UNREACHABLE_* names going to "1" — which hard-blocked unibox
+      // replies to leads who had just messaged us (2026-09-04, kelseymholloway).
+      // The Relay thread status is request-state, not reply-deliverability; the
+      // map always reports "0" (see _getAllMessagesFromRelay).
       async _getAllMessagesUnsafe() {
         const t = await this._importDefault("bs_caml_int64");
         var e = (await this._getDatabase("messages")).map((e) => this._formatData({ data: e, bs_caml_int64: t })),
