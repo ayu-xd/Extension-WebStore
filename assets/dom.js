@@ -1006,8 +1006,12 @@ class ADBlockDOM {
     err.statusCode = Number.isFinite(status) ? status : null;
     return err;
   }
-  async _importNamespace(t) {
-    for (let e = 0; e < 15; e++) {
+  async _importNamespace(t, _maxAttempts = 15) {
+    // _maxAttempts: callers on the send hot-path pass a small bound so a
+    // module that will never appear (Slide-stack accounts) fails in ~2-3s
+    // instead of 15-30s — a 15s failure inside waitForViewerReady's poll loop
+    // made every poll overrun the deadline and stretched init to 30-47s.
+    for (let e = 0; e < _maxAttempts; e++) {
       var s = importNamespace(t);
       if (s) return s;
       await this.sleep(1e3)
@@ -1024,32 +1028,43 @@ class ADBlockDOM {
   }
   async _getUser() {
     // ADDL-FAST-01: ask the Relay store first — it answers in milliseconds and
-    // is always populated on a logged-in page. The PolarisConfig ladder below
-    // retries a missing module 15x1s on migrated builds, and it runs on EVERY
-    // getInfo poll during init: the 2026-09-04 bundles show 15-40s of
-    // "Waiting for initialization" per send because waitForViewerReady's
-    // window was consumed by one or two of those ladders before the page's
-    // viewer data ever arrived. The legacy path stays as the fallback.
+    // is always populated on a logged-in page (once React has mounted). The
+    // PolarisConfig ladder below retries a missing module 15x1s on migrated
+    // builds, and it runs on EVERY getInfo poll during init: the 09-04/05
+    // bundles show 26-31s of "Waiting for initialization" per send because
+    // waitForViewerReady's window was consumed by those ladders before the
+    // page's viewer data ever arrived. Two hardening details matter:
+    //   • timeoutMs 5000 — a getUser posted before ReactDev finishes booting
+    //     would otherwise hang with NO timeout at all (this bridge has none),
+    //     stalling the poll loop past its own deadline.
+    //   • 60s cache — waitForViewerReady polls every 250ms; without the cache
+    //     each poll pays the bridge + store read again.
+    // The legacy path stays as the fallback for pre-migration accounts.
+    if (this._relayViewerCache && Date.now() - this._relayViewerAt < 60000) {
+      return this._relayViewerCache;
+    }
     try {
       const {
         id: s,
         username: e,
         profilePictureUrl: n
-      } = await this.domReactConnector.send("getUser", {});
+      } = await this.domReactConnector.send("getUser", {}, { timeoutMs: 5000 });
       if (e && "Instagram User" !== e) {
-        return {
+        this._relayViewerAt = Date.now();
+        this._relayViewerCache = {
           username: e.startsWith("@") ? e.substring(1) : e,
           profile_pic_url: n,
           id: s
-        }
+        };
+        return this._relayViewerCache;
       }
     } catch (_relayErr) { /* fall through to the legacy PolarisConfig path */ }
-    if (!(await this._importNamespace("PolarisConfig"))?.getViewerData_DO_NOT_USE?.()?.username) {
+    if (!(await this._importNamespace("PolarisConfig", 2))?.getViewerData_DO_NOT_USE?.()?.username) {
       const {
         id: s,
         username: e,
         profilePictureUrl: n
-      } = await this.domReactConnector.send("getUser", {});
+      } = await this.domReactConnector.send("getUser", {}, { timeoutMs: 5000 });
       return {
         username: e.startsWith("@") ? e.substring(1) : e,
         profile_pic_url: n,
@@ -1060,7 +1075,7 @@ class ADBlockDOM {
       username: e,
       profile_pic_url: t,
       id: s
-    } = (await this._importNamespace("PolarisConfig")).getViewerData_DO_NOT_USE();
+    } = (await this._importNamespace("PolarisConfig", 2)).getViewerData_DO_NOT_USE();
     var r;
     return "Instagram User" === e && (r = await this.domReactConnector.send("getUser", {}), e = r.username), {
       username: e.startsWith("@") ? e.substring(1) : e,

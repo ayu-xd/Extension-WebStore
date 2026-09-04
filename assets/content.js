@@ -442,15 +442,20 @@ class Instagram {
       this.log({ type: "Dom injected", data: {} });
       this.registerTasks();
       this.log({ type: "Tasks registered", data: {} });
-      // Wait for IG's SPA to actually be ready (poll) instead of a blind 7s sleep.
-      const viewerInfo = await this.waitForViewerReady().catch(e => { this.log({ type: "[initMain] waitForViewerReady error", data: { error: e?.message } }); return null; });
+      // ADDL-FAST-01: the viewer read is a PREFETCH now, not a gate — 3s cap.
+      // It has never succeeded in a month of logs because React mounts 15-30s
+      // after the page on cold background tabs, and holding init open for it
+      // stalled every task 30-47s. Registration and the chat handler run in
+      // the background with their own retry ladders; the gate below clears in
+      // ~1-10s and tasks start immediately.
+      const viewerInfo = await this.waitForViewerReady({ timeoutMs: 10000 }).catch(e => { this.log({ type: "[initMain] waitForViewerReady error", data: { error: e?.message } }); return null; });
       this.log({ type: "[initMain] Calling preTaskHooks", data: {} });
       await this.domConnector.send("preTaskHooks", {}).catch(e => this.log({ type: "[initMain] preTaskHooks error", data: { error: e?.message } }));
-      this.log({ type: "[initMain] Calling registerAccounts", data: {} });
-      await this.registerAccounts(viewerInfo).catch(e => this.log({ type: "[initMain] registerAccounts error", data: { error: e?.message } }));
-      this.log({ type: "[initMain] Calling injectIntoChat", data: {} });
-      await this.injectIntoChat().catch(e => this.log({ type: "[initMain] injectIntoChat error", data: { error: e?.message } }));
-      this.log({ type: "Chat handler injected", data: {} });
+      this.log({ type: "[initMain] registerAccounts (background)", data: {} });
+      this.registerAccountsWithRetry(viewerInfo).catch(e => this.log({ type: "[initMain] registerAccounts error", data: { error: e?.message } }));
+      this.log({ type: "[initMain] injectIntoChat (background)", data: {} });
+      this.injectIntoChatWithRetry().catch(e => this.log({ type: "[initMain] injectIntoChat error", data: { error: e?.message } }));
+      this.log({ type: "Chat handler injected (deferred)", data: {} });
       this.log({ type: "[initMain] Calling checkDelayedTask", data: {} });
       await this.checkDelayedTask().catch(e => this.log({ type: "[initMain] checkDelayedTask error", data: { error: e?.message } }));
       this.log({ type: "[initMain] Completed fully", data: {} });
@@ -470,11 +475,13 @@ class Instagram {
       this.log({ type: "[Additional] Dom injected", data: {} });
       this.registerTasks();
       this.log({ type: "[Additional] Tasks registered", data: {} });
-      // Poll for SPA readiness instead of a blind 7s sleep.
-      await this.waitForViewerReady().catch(e => this.log({ type: "[Additional] waitForViewerReady error", data: { error: e?.message } }));
+      // ADDL-FAST-01: same prefetch-and-defer pattern as initMain — 3s viewer
+      // cap, registration and chat handler in the background. The gate below
+      // clears in ~1-10s instead of holding the reply 40-47s.
+      await this.waitForViewerReady({ timeoutMs: 10000 }).catch(e => this.log({ type: "[Additional] waitForViewerReady error", data: { error: e?.message } }));
       await this.domConnector.send("preTaskHooks", {}).catch(e => this.log({ type: "[Additional] preTaskHooks error", data: { error: e?.message } }));
-      await this.injectIntoChat().catch(e => this.log({ type: "[Additional] injectIntoChat error", data: { error: e?.message } }));
-      this.log({ type: "[Additional] Chat handler injected", data: {} });
+      this.injectIntoChatWithRetry().catch(e => this.log({ type: "[Additional] injectIntoChat error", data: { error: e?.message } }));
+      this.log({ type: "[Additional] Chat handler injected (deferred)", data: {} });
     } catch (e) {
       this.log({ type: "[Additional] UNEXPECTED ERROR", data: { error: e?.message } });
     } finally {
@@ -1649,19 +1656,64 @@ class Instagram {
     try {
       // Reuse the info waitForViewerReady() already fetched (no extra wait /
       // no second read). Fall back to a fresh getInfo only if not provided.
+      // Returns NULL when the page cannot answer yet (React not mounted on a
+      // cold background tab takes 15-30s) — registerAccountsWithRetry owns
+      // the retry ladder; the old silent accounts:[]-error send made a
+      // not-ready page look like a successful no-op registration.
       var {
         accounts: e,
         currentUser: t
       } = prefetched || await this.domConnector.send("getInfo", {});
+      if (!t?.username) return null;
       return this.backgroundConnector.send("registerAccounts", {
         accounts: e,
         current_id: t.id
       })
     } catch (e) {
-      return this.backgroundConnector.send("registerAccounts", {
-        accounts: [],
-        error: !0
-      })
+      return null;
+    }
+  }
+  // ADDL-FAST-01 companion: the username binding is a one-time database
+  // operation, not a per-send dependency — the 09-04/05 logs prove sends work
+  // for hours with the binding landing late. So init fires this WITHOUT
+  // awaiting and retries in the background until the page can answer, instead
+  // of holding every task hostage in the isInitializing gate while
+  // waitForViewerReady burns its window on a page that isn't ready yet.
+  async registerAccountsWithRetry(prefetched) {
+    const _deadline = Date.now() + 180000;
+    let _attempts = 0;
+    while (Date.now() < _deadline) {
+      _attempts++;
+      const _res = await this.registerAccounts(_attempts > 1 ? null : prefetched).catch(() => null);
+      if (_res) {
+        this.log({ type: "[registerAccounts] account bound", data: { attempts: _attempts } });
+        return _res;
+      }
+      await this.sleep(5000).catch(() => {});
+    }
+    this.log({ type: "[registerAccounts] page never answered — will bind on next tab init", data: { attempts: _attempts } });
+    return null;
+  }
+  // MQTT subscription for outgoing-message store verification. It fails on
+  // every migrated account (the modules it imports are gone) and every send
+  // still verifies via the DOM fallback — so it must never hold init: fire it
+  // in the background and retry once.
+  async injectIntoChatWithRetry() {
+    try {
+      await this.injectIntoChat();
+      this.log({ type: "[chatHandler] injected", data: {} });
+      return true;
+    } catch (e) {
+      this.log({ type: "[chatHandler] first attempt failed — retrying once in 10s", data: { error: e?.message } });
+      await this.sleep(10000).catch(() => {});
+      try {
+        await this.injectIntoChat();
+        this.log({ type: "[chatHandler] injected (retry)", data: {} });
+        return true;
+      } catch (e2) {
+        this.log({ type: "[chatHandler] unavailable this page — DOM verification stays the fallback", data: { error: e2?.message } });
+        return false;
+      }
     }
   }
   async injectIntoChat() {

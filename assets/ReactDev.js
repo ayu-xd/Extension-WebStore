@@ -1279,6 +1279,8 @@
         throw new Error("No wrapper");
       }
       async _getUser() {
+        const _t0 = Date.now();
+        let _legacyErr = null;
         try {
           var e = this._getState();
           if (!e) throw new Error("No state");
@@ -1287,32 +1289,57 @@
           e = e.users?.users?.toJSON?.();
           if (!e) throw new Error("No users in state");
           e = e[t];
-          if (e) return e;
-          throw new Error("No user in state");
+          // v1.4.10 returned the legacy record blindly — a stub without a real
+          // username is as useless as a throw: dom.js discarded it and every
+          // getInfo poll fell through to the 15-30s PolarisConfig ladder, so
+          // the viewer check still timed out on every init (2026-09-05 logs).
+          if (e?.username && "Instagram User" !== e.username) return e;
+          if (!this._getUserWarned) {
+            this._getUserWarned = true;
+            console.warn("[DMDroid] legacy state has no usable username:", (() => { try { return JSON.stringify(e).slice(0, 140); } catch (_) { return String(e); } })());
+          }
         } catch (legacyErr) {
-          // Relay fallback: on Slide-stack accounts the legacy state store is
-          // dead, so this read threw on every call and waitForViewerReady
-          // burned its whole window on every init — 14 log files spanning
-          // Aug 7 -> Sep 4 contain 20+ timeouts and ZERO successes, and each
-          // one stretched task startup by 15-40s. The Relay viewer record is
-          // always present on a logged-in page (client:root:viewer ->
-          // XDTUserDict), so init proceeds on the first poll instead.
-          try {
-            const env = this._getRelayEnv();
-            if (env) {
-              const recs = env.getStore().getSource().toJSON();
-              const ref = recs["client:root:viewer"]?.xdt_user?.__ref;
-              const u = ref ? recs[ref] : null;
-              if (u?.username)
-                return {
-                  id: String(u.pk ?? u.id ?? String(ref).split(":")[1] ?? ""),
-                  username: u.username,
-                  profilePictureUrl: u.profile_pic_url ?? null,
-                };
-            }
-          } catch (relayErr) { /* fall through to the original error */ }
-          throw legacyErr;
+          _legacyErr = legacyErr;
+          if (!this._getUserWarned) {
+            this._getUserWarned = true;
+            console.warn("[DMDroid] legacy _getState failed:", String(legacyErr?.message || legacyErr));
+          }
         }
+        // Relay fallback: on Slide-stack accounts the legacy state store is
+        // dead or stubbed, so this read failed on every call and
+        // waitForViewerReady burned its whole window on every init — 14 log
+        // files spanning Aug 7 -> Sep 4 show 20+ timeouts and ZERO successes.
+        // The Relay viewer record is always present on a logged-in page once
+        // React has mounted (client:root:viewer -> XDTUserDict). Before that
+        // moment this fallback returns null and the CALLER retries — init no
+        // longer blocks on it (registerAccountsWithRetry owns the binding).
+        try {
+          const env = this._getRelayEnv();
+          if (env) {
+            const recs = env.getStore().getSource().toJSON();
+            const ref = recs["client:root:viewer"]?.xdt_user?.__ref;
+            const u = ref ? recs[ref] : null;
+            if (u?.username && "Instagram User" !== u.username)
+              return {
+                id: String(u.pk ?? u.id ?? String(ref).split(":")[1] ?? ""),
+                username: u.username,
+                profilePictureUrl: u.profile_pic_url ?? null,
+              };
+            if (!this._getUserWarned) {
+              this._getUserWarned = true;
+              console.warn("[DMDroid] Relay store reachable but viewer record unusable");
+            }
+          } else if (!this._getUserWarned) {
+            this._getUserWarned = true;
+            console.warn("[DMDroid] Relay env not found for viewer read (React not mounted yet?)");
+          }
+        } catch (relayErr) {
+          if (!this._getUserWarned) {
+            this._getUserWarned = true;
+            console.warn("[DMDroid] Relay viewer read failed:", String(relayErr?.message || relayErr));
+          }
+        }
+        throw _legacyErr || new Error("No user in state");
       }
       async _getMessages() {
         for (let e = 0; e < 15 && !this.root.findMany("MWPBaseMessage.react").length; e++) await this.sleep(1e3);
