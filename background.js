@@ -3023,6 +3023,17 @@ async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) 
   }
 
   debugLog(`[sendTaskToContent] Sending actual task ${taskType} to tab ${tabId}...`);
+  // COLD-PACE-01: ColdDMs parity — their background sleeps 5s after a successful
+  // ping before dispatching the task (Colddms Latest/background.js:6398). The
+  // ping proves the CONTENT script is alive, not the page world: ReactDev boots
+  // a few seconds later on a cold tab, and a bridge call posted pre-boot is
+  // dropped by postMessage with no error, hanging until the 30s cap (the
+  // 2026-09-05 log: two preTaskHooks timeouts, two tab destroys on one task —
+  // attempt 3 won with ~6s of settle time the first two never got). v1.4.12-15
+  // removed the viewer-wait that accidentally provided this buffer; this restores
+  // the parent's deliberate one. Paid once per dispatch, nothing against the
+  // 3-min send floor.
+  await sleep(5000);
   // ADDL-GUARD-01: mark the additional tab as in flight for this dispatch.
   // The mark is a timestamp, not a flag — it expires naturally after the grace
   // window (11 min > the 10-min watchdog ceiling), so there is no finally to
