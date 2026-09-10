@@ -263,7 +263,8 @@ class Instagram {
       username: a,
       targetUserId: r,
       useProfile: i,
-      isTakeSnapshot: n
+      isTakeSnapshot: n,
+      replyCheckSince
     }) => this.tasks.checkResponse({
       threadId: e,
       taskId: t,
@@ -271,7 +272,8 @@ class Instagram {
       username: a,
       targetUserId: r,
       useProfile: i,
-      isTakeSnapshot: n
+      isTakeSnapshot: n,
+      replyCheckSince
     })), this.backgroundConnector.registerTask("collectMessages", async () => this.tasks.collectMessages()), this.backgroundConnector.registerTask("debug", async ({
       taskId: e,
       type: t,
@@ -672,7 +674,8 @@ class Instagram {
         username: a,
         targetUserId: r,
         useProfile: i = !1,
-        isTakeSnapshot: n
+        isTakeSnapshot: n,
+        replyCheckSince
       }, {
         attempt: o
       } = {}) => {
@@ -712,21 +715,19 @@ class Instagram {
                   taskType: "checkResponse"
                 })
               }
-            if (i) await this.domConnector.send("openChatFromProfile", {
-              username: a,
-              id: e
-            }), this.log({
-              type: "User opened",
-              data: {}
-            });
-            else {
-              await this._openDirectIfNeeded(), this.log({
+            // checkResponse always takes the direct path (the openChatFromProfile
+            // leg was deleted: a 429-prone API call on a reply *check*; the
+            // getUserByUsername pre-lookup above stays, targetUserId is still
+            // needed downstream. sendMessage keeps its own profile leg.
+            await this._openDirectIfNeeded(), this.log({
                 type: "Direct button found and clicked",
                 data: {}
-              }), await this.sleep(5e3);
+              }),               await this.sleep(5e3);
               var d = await this.checkResponseByReactAPI({
-                username: a
+                username: a,
+                sinceMs: replyCheckSince ?? null
               });
+              this.log({ type: "checkResponse anchor", data: { username: a, sinceMs: replyCheckSince ?? null, replyTimestampMs: String(d?.timestampMs ?? ""), text: String(d?.text ?? "").substring(0, 60) } });
               if (d) return this.backgroundConnector.emit("successTask", {
                 result: !0,
                 taskId: t,
@@ -747,11 +748,12 @@ class Instagram {
                 type: "User is already opened",
                 data: {}
               })
-            }
             var l = await this.checkResponseByReactAPI({
-                username: a
+                username: a,
+                sinceMs: replyCheckSince ?? null
               }),
               h = Boolean(l);
+            this.log({ type: "checkResponse anchor", data: { username: a, sinceMs: replyCheckSince ?? null, replyTimestampMs: String(l?.timestampMs ?? ""), text: String(l?.text ?? "").substring(0, 60) } });
             return this.backgroundConnector.emit("successTask", {
               result: h,
               taskId: t,

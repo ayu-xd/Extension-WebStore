@@ -932,10 +932,12 @@ async function pollUniboxReplies() {
       // resolve lead handle from contact relation
       let targetUsername = null;
       let targetFullName = null;
+      let targetReplyCheckSince = null;
       if (rt.contact_id) {
-        const ct = await supabaseReq(`contacts?select=username,full_name&id=eq.${rt.contact_id}`);
+        const ct = await supabaseReq(`contacts?select=username,full_name,dmed_at,last_follow_up_at&id=eq.${rt.contact_id}`);
         targetUsername = ct?.[0]?.username || null;
         targetFullName = usableFullName(ct?.[0]);
+        targetReplyCheckSince = replyCheckSinceFor(ct?.[0]);
       }
       if (!targetUsername) throw Object.assign(new Error("Lead handle missing for queued reply"), { permanent: true });
       if (!rt.thread_id) throw Object.assign(new Error("No thread id on queued reply"), { permanent: true });
@@ -948,7 +950,7 @@ async function pollUniboxReplies() {
         "additional",
         "sendMessageFromDialog",
         {
-          target: { username: targetUsername, fullName: targetFullName },
+          target: { username: targetUsername, fullName: targetFullName, replyCheckSince: targetReplyCheckSince },
           message: { text: rt.message_text },
           taskId: rt.id,
           skipMessageExistsCheck: true
@@ -1876,7 +1878,9 @@ async function pollTasks() {
     }
 
     if (task.contact_id) {
-      const contacts = await supabaseReq(`contacts?select=username,full_name&id=eq.${task.contact_id}`);
+      // ANCHOR: dmed_at/last_follow_up_at feed replyCheckSinceFor below (2
+      // tiny cols on an already-narrow single-row fetch — negligible egress).
+      const contacts = await supabaseReq(`contacts?select=username,full_name,dmed_at,last_follow_up_at&id=eq.${task.contact_id}`);
       if (contacts && contacts.length > 0) {
         task.contacts = contacts[0];
       }
@@ -2300,6 +2304,20 @@ async function pollTasks() {
 // Lead name resolution (server-side first)
 // ---------------------------------------------------------------------------
 
+// ANCHOR: last outbound timestamp for reply checks (ms epoch) or null.
+// checkResponseByReactAPI filters inbound to timestampMs > sinceMs, so a
+// historic reply can never count as fresh. max() of both send markers;
+// never-contacted leads (no dates) correctly yield null — there is no prior
+// send to anchor against, and the WARNING path handles that visibly.
+// Pure function of the contact row: safe to call on any payload path.
+function replyCheckSinceFor(contact) {
+  const t = Math.max(
+    contact?.dmed_at ? new Date(contact.dmed_at).getTime() : 0,
+    contact?.last_follow_up_at ? new Date(contact.last_follow_up_at).getTime() : 0
+  );
+  return Number.isFinite(t) && t > 0 ? t : null;
+}
+
 // N1: return contacts.full_name only when it holds a REAL name, never a
 // placeholder. Importers and the unibox sync both write the username into
 // full_name when they have nothing better, and some rows carry "@handle" or a
@@ -2526,7 +2544,7 @@ async function executeTask(task) {
     }
 
     const payload = {
-      target: { username: targetUsername, fullName: usableFullName(task.contacts) },
+      target: { username: targetUsername, fullName: usableFullName(task.contacts), replyCheckSince: replyCheckSinceFor(task.contacts) },
       message: { text: finalMessageText },
       taskId: task.id,
       hasImage,
@@ -2717,7 +2735,7 @@ async function executeTask(task) {
     debugLog(`[Followup] Routing via main-tab live-id scrape -> additional-tab thread open for ${targetUsername}`);
 
     const payload = {
-      target: { username: targetUsername, fullName: usableFullName(task.contacts) },
+      target: { username: targetUsername, fullName: usableFullName(task.contacts), replyCheckSince: replyCheckSinceFor(task.contacts) },
       message: { text: task.message_text },
       taskId: task.id,
       skipMessageExistsCheck: false,
