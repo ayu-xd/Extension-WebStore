@@ -350,11 +350,13 @@ class Instagram {
     return t < 1e12 ? null : String(t)
   }
   async _emitUniboxCapture(targetUsername = null) {
-    // UNIBOX CAPTURE — HYBRID (plan v2 §5.4):
+    // UNIBOX CAPTURE — HYBRID (plan v2 §5.4 + relay backfill):
     //  primary: full ReStore dump via getAllMessages (old-stack accounts)
-    //  fallback: live OffMsys DOM rows (new-stack accounts where MSYS tables
-    //  don't exist). Fallback requires a KNOWN target username, so it only
-    //  runs from post-send hooks — never blind, matching ColdDMs' design.
+    //  per-thread backfill: threads whose ReStore rows carry no messages get
+    //    a Relay-store read by thread_key (new-stack accounts where ReStore
+    //    holds thread shells without content — Sep-09: 15 shells, 0 messages,
+    //    sync deadlocked forever). Bounded (10 threads/run), explicit timeouts.
+    //  legacy post-send DOM path: only when the whole dump is empty (kept).
     try {
       const u = await this.domConnector.send("getUser", {});
       let t = null;
@@ -408,6 +410,39 @@ class Instagram {
           this.log({ type: "[unibox] DOM capture skipped", data: { targetUsername, rowCount: c?.rowCount ?? 0, reason: skipReason } });
         }
       }
+      // UNIBOX-BACKFILL: per-thread Relay rescue. ReStore thread shells with
+      // empty messages (Slide-cutover signature) get one Relay read each by
+      // thread_key, mapped into the ReStore row shape downstream expects.
+      // Bounded: max 10 hollow threads per run, 15s each, allSettled — a wedged
+      // read degrades to that thread staying hollow, never stalls the capture.
+      try {
+        const _entries = t ? Object.entries(t) : [];
+        const _hollow = _entries.filter(([, info]) => info && info.thread_key && (!Array.isArray(info.messages) || !info.messages.length)).slice(0, 10);
+        if (_hollow.length) {
+          const _res = await Promise.allSettled(_hollow.map(([, info]) =>
+            this.domConnector.send("getRelayThreadText", { threadKey: String(info.thread_key), sinceMs: 0 }, { timeoutMs: 15000 }).catch(() => null)
+          ));
+          let _filled = 0;
+          _res.forEach((r, i) => {
+            if (r.status !== "fulfilled" || !r.value) return;
+            const _rows = Array.isArray(r.value.rows) ? r.value.rows : [];
+            if (!_rows.length) return;
+            const [un] = _hollow[i];
+            t[un].messages = _rows.map(x => ({
+              messageId: x.mid,
+              text: x.text,
+              timestampMs: String(x.ts),
+              username: x.username || (x.outgoing === false ? un : (x.outgoing === true ? (u.username ?? null) : null)),
+              instagram_id: x.instagram_id || null,
+            }));
+            _filled++;
+          });
+          if (_filled) {
+            source = source === "restore" ? "restore+relay" : source;
+            this.log({ type: "[unibox] relay backfill", data: { filled: _filled, of: _hollow.length } });
+          }
+        }
+      } catch (_e) { }
       if (t && Object.keys(t).length && u?.id) {
         await this.backgroundConnector.emit("saveConversations", {
           threads: t,
@@ -1896,40 +1931,66 @@ class Instagram {
     throw new Error("Message not found")
   }
   async _checkMessageExists({ dateBeforeSend: t, isFirstMessageThread: s, text: a = null, prevTailId: l = null, hasPreSendSnapshot: h = true }) {
-    // v3 verifier: three independent signals instead of one dead one.
-    //  - DOM check (legacy, kept): works on some IG builds only
-    //  - STORE TEXT: getLastMessagesUnsafe works on current IG (proven in logs)
-    //  - TAIL CHANGE: a new message id appeared at the thread tail after send
+    // v4 verifier (AND-rule): store text-after-tail AND (tail changed OR fiber
+    // corroboration). The old OR-rule let a timestamp-only fiber hit pass alone
+    // (Sep-08 ansab.7: false success on a never-sent message). All three legs
+    // run SIMULTANEOUSLY per round (bridge multiplexes by response id) with
+    // explicit timeouts — an unsettled leg reads as miss, never hangs the round.
     var attempts = s ? 25 : 20;
-    const norm = x => String(x ?? "").replace(/\s+/g, " ").trim();
+    const norm = x => String(x ?? "").replace(/\s+/g, " ").trim().toLowerCase();
     const needle = a ? norm(a).slice(0, 40) : null;
+    const _m = window.location.href.match(/direct\/t\/(\d+)/);
+    const _threadKey = _m ? _m[1] : null;
     for (let e = 0; e < attempts; e++) {
-      var r = !1;
+      const [rSettled, relaySettled, storeSettled] = await Promise.allSettled([
+        this.domConnector.send("checkOutgoingMessageSentFromDOM", { dateBeforeSend: t }, { timeoutMs: 15000 }).catch(() => !1),
+        this.domConnector.send("getRelayThreadText", { threadKey: _threadKey, sinceMs: t }, { timeoutMs: 15000 }).catch(() => null),
+        this.domConnector.send("getLastMessagesUnsafe", {}, { timeoutMs: 20000 }).catch(() => null),
+      ]);
+      const r = rSettled.status === "fulfilled" ? rSettled.value : !1;
+      const relay = relaySettled.status === "fulfilled" ? relaySettled.value : null;
+      const msgs = storeSettled.status === "fulfilled" ? storeSettled.value : null;
+      let storeHit = !1, tailChanged = !1, storeSource = null;
+      // Relay leg (Slide-stack): text-after-tail on thread-scoped outgoing rows.
+      // Anchor falls back to the freshness window when id shapes don't align
+      // (ReStore snapshot ids vs Relay mids); known-incoming rows excluded.
       try {
-        r = await this.domConnector.send("checkOutgoingMessageSentFromDOM", { dateBeforeSend: t });
+        const _rows = Array.isArray(relay?.rows) ? relay.rows : [];
+        if (needle && h) {
+          const _tailIndex = l == null ? -1 : _rows.findIndex(x => String(x.mid) === String(l));
+          const _after = _tailIndex >= 0 ? _rows.slice(_tailIndex + 1)
+            : (l == null ? _rows : _rows.filter(x => x.ts != null && x.ts >= Number(t)));
+          const _hit = _after.find(x => x.outgoing !== !1 && norm(x.text).includes(needle));
+          if (_hit) { storeHit = !0; storeSource = "relay"; }
+        }
+        const _tailId = relay?.tailId || null;
+        if (h && l && _tailId && String(_tailId) !== String(l)) tailChanged = !0;
       } catch (_e) { }
-      let storeHit = !1, tailChanged = !1;
+      // Legacy leg (ReStore accounts): unchanged semantics, needle now lowered
+      // (case-variant text previously missed — probe lesson).
       try {
-        const msgs = await this.domConnector.send("getLastMessagesUnsafe", {});
-        if (msgs?.length) {
+        if (!storeHit && msgs?.length) {
           if (needle && h) {
-            // Only accept a matching message that appeared after the saved tail.
-            // Without this anchor, an older identical DM can make a failed send
-            // look successful and hide the real problem.
             const tailIndex = l == null ? -1 : msgs.findIndex(m => String(m.messageId) === String(l));
-            const newMessages = tailIndex >= 0 ? msgs.slice(tailIndex + 1) : (l == null ? msgs : []);
+            const newMessages = tailIndex >= 0 ? msgs.slice(tailIndex + 1)
+              : (l == null ? msgs : msgs.filter(m => m.timestampMs != null && Number(m.timestampMs) >= Number(t)));
             storeHit = newMessages.some(m => norm(m.text).includes(needle));
+            if (storeHit) storeSource = "restore";
           }
           if (h && l && String(msgs[msgs.length - 1].messageId) !== String(l)) tailChanged = !0;
         }
       } catch (_e) { }
       this.log({
         type: "Checking if message was sent",
-        data: { attempt: e, domHit: r, storeHit, tailChanged, isFirstMessageThread: s }
+        data: { attempt: e, domHit: r, storeHit, storeSource, tailChanged, isFirstMessageThread: s }
       });
-      if (r || storeHit) return this.log({ type: "Check message exists returning true", data: { isFirstMessageThread: s } }), !0;
-      // Tail-change alone needs a few confirmations (guards against a pre-enter race)
-      if (tailChanged && e >= 4) return this.log({ type: "Check message exists returning true (tail)", data: {} }), !0;
+      if (storeHit && (tailChanged || r)) return this.log({ type: "Check message exists returning true", data: { isFirstMessageThread: s, storeSource } }), !0;
+      // Tail-change alone needs many confirmations (guards against a pre-enter
+      // race AND gives the store leg room to fire first: on slow-hydrating
+      // dialog tabs Relay text materializes after the tail moves (Sep-09
+      // beautycharm runs passed here at round 4 before the store leg ever got
+      // its full window). Refusals are unaffected — they run all rounds anyway.
+      if (tailChanged && e >= 10) return this.log({ type: "Check message exists returning true (tail)", data: {} }), !0;
       await this.sleep(1e3)
     }
     return this.log({ type: "Check message exists returning false", data: { isFirstMessageThread: s } }), !1
@@ -2023,13 +2084,16 @@ class Instagram {
     const expected = norm(t);
     let typed = "";
     for (let attempt = 0; attempt < 3; attempt++) {
-      // F10: no timeout on typing — per-char timers get throttled to ~1s in
-      // background tabs, so a 45s guillotine cut long messages mid-flight and
-      // the retry replayed them from scratch (matches ColdDMs: no timeout here).
-      // Failures are caught downstream by the composer-empty verification.
+      // F10 (amended): the old 45s guillotine cut long messages mid-flight under
+      // background-tab throttling, so typing stays unbounded per-char — but the
+      // bridge wait itself is now capped at 120s. A healthy page answers in
+      // seconds; a wedged page used to hang here FOREVER with zero logging
+      // (Sep-08 bundle: 14.5 min of silence, 11 incidents). On timeout the
+      // error propagates to the normal failure path (tab recovery + retry)
+      // instead of freezing the worker until the 10-min watchdog.
       await this.domConnector.send("enterMessage", {
         text: t
-      }, { timeoutMs: 0 });
+      }, { timeoutMs: 120000 });
       await this.sleep(Helpers.rand(50, 150));
       typed = await this.domConnector.send("getMessageInput", {});
       if (norm(typed) === expected) break;
@@ -2122,9 +2186,26 @@ class Instagram {
     if (_fromPayload) {
       this.log({ type: "Using server-supplied lead name — skipping Instagram lookup", data: { username: e, fullName: _payloadName } });
     } else {
+      // RELAY-NAME: try the local Relay store first — zero network, immune to
+      // 429/auth. Quality-gated (non-empty, not handle-equal); any miss falls
+      // through to the Polaris lookup below, never throws.
       try {
-        s = await this.domConnector.send("getUserByUsername", { username: e });
-      } catch (err) {}
+        const _relay = await this.domConnector.send("getRelayUserByUsername", { username: e }, { timeoutMs: 8000 });
+        const _fn = _relay && typeof _relay.full_name === "string" ? _relay.full_name.trim() : "";
+        if (_fn && _fn.toLowerCase() !== String(e || "").trim().replace(/^@+/, "").toLowerCase()) {
+          s = { full_name: _fn, username: e };
+          this.log({ type: "relay_name_hit", data: { username: e, fullName: _fn } });
+        } else {
+          this.log({ type: "relay_name_miss", data: { username: e, reason: _relay ? "quality-gated" : "not-in-store" } });
+        }
+      } catch (err) {
+        this.log({ type: "relay_name_miss", data: { username: e, reason: "bridge-error" } });
+      }
+      if (!s) {
+        try {
+          s = await this.domConnector.send("getUserByUsername", { username: e });
+        } catch (err) {}
+      }
     }
     if (s) {
       const firstName = (u) =>

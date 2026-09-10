@@ -138,7 +138,9 @@ class ADBlockDOM {
       text: e
     })), this.domConnector.registerTask("sendMessage", () => this._sendMessage()), this.domConnector.registerTask("sendImage", (data) => this._sendImage(data)), this.domConnector.registerTask("getMessageInput", () => this._getMessageInput()), this.domConnector.registerTask("injectIntoChat", () => this._injectIntoChat()), this.domConnector.registerTask("getLastMessages", () => this._getLastMessages()), this.domConnector.registerTask("getLastMessagesUnsafe", () => this._getLastMessagesUnsafe()), this.domConnector.registerTask("preTaskHooks", () => this._preTaskHooks()), this.domConnector.registerTask("getUserByUsername", ({
       username: e
-    }) => this._getUserByUsername(e)), this.domConnector.registerTask("inputSearch", ({
+    }) => this._getUserByUsername(e)), this.domConnector.registerTask("getRelayUserByUsername", ({
+      username: e
+    }) => this._getRelayUserByUsername(e)), this.domConnector.registerTask("getRelayThreadText", (e = {}) => this._getRelayThreadText(e)), this.domConnector.registerTask("inputSearch", ({
       username: e
     }) => this._inputSearch({
       username: e
@@ -245,6 +247,22 @@ class ADBlockDOM {
   // UNIBOX CAPTURE bridge — forwards to the React layer's OffMsys row reader.
   async _collectThreadFromDOM(e = {}) {
     return this.domReactConnector.send("collectThreadFromDOM", e)
+  }
+  // RELAY-NAME bridge — local store name lookup. Miss/null/timeout is normal
+  // (cold lead, thin store, React not mounted): callers fall through to the
+  // network path, so this never throws.
+  async _getRelayUserByUsername(e) {
+    try {
+      return await this.domReactConnector.send("getRelayUserByUsername", { username: e }, { timeoutMs: 8000 })
+    } catch (_) { return null }
+  }
+  // RELAY-VERIFY bridge — thread-scoped outgoing rows for send verification.
+  // Explicit timeout: dom→React sends default to unbounded, and an unsettled
+  // leg must never stall the verifier's parallel round (Sep-08 hang lesson).
+  async _getRelayThreadText(e = {}) {
+    try {
+      return await this.domReactConnector.send("getRelayThreadText", e, { timeoutMs: 15000 })
+    } catch (_) { return null }
   }
   log({
     data: e,
@@ -860,7 +878,9 @@ class ADBlockDOM {
   }
   async _getLastMessagesUnsafe() {
     for (let e = 0; e < 10; e++) {
-      var t = await this.domReactConnector.send("getMessagesUnsafe", {});
+      // Explicit bound (see _checkOutgoingMessageSentFromDOM): the inner
+      // getMessagesUnsafe call must never hang the caller indefinitely.
+      var t = await this.domReactConnector.send("getMessagesUnsafe", {}, { timeoutMs: 15000 });
       if (t.length) {
         var s = [];
         for (const r of t) s.push(await this.prepareMessage(r));
@@ -1193,9 +1213,11 @@ class ADBlockDOM {
   async _checkOutgoingMessageSentFromDOM({
     dateBeforeSend: e
   }) {
+    // Explicit bound: dom→React sends default to unbounded, and this leg
+    // feeds the verifier's parallel round (Sep-08 hang lesson).
     return this.domReactConnector.send("checkOutgoingMessageSentFromDOM", {
       dateBeforeSend: e
-    })
+    }, { timeoutMs: 15000 })
   }
   async _navigateToInbox() {
     var e = window.importNamespace?.("PolarisNavigationUtils");

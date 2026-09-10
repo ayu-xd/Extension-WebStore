@@ -143,7 +143,14 @@ async function syncStatsFromDatabase() {
     // exactly as the web dashboard does (lib/scheduler.ts splits failed vs
     // unreachable on this column). A lead who no longer exists is attrition, not
     // a failed send, and it must not read as one in either surface.
-    const rows = await supabaseReq(`dm_tasks?select=id,status,unreachable_type&browser_instance_id=eq.${state.browserId}&status=in.(completed,failed)`);
+    const rows = await supabaseReq(`dm_tasks?select=id,status,unreachable_type&browser_instance_id=eq.${state.browserId}&status=in.(completed,failed)&order=completed_at.desc.nullslast&limit=${EGRESS.statsHistoryLimit}`);
+    // EGRESS-E8/EGRESS-LOG: history is unbounded as months accumulate; the cap
+    // keeps this read constant-size. Exact counts hold until a browser passes
+    // statsHistoryLimit rows — then stats_cap_hit fires instead of silently
+    // undercounting.
+    if ((rows || []).length >= EGRESS.statsHistoryLimit) {
+      dlog("stats_cap_hit", { rows: rows.length, limit: EGRESS.statsHistoryLimit }, "warn");
+    }
     const stats = (rows || []).reduce((acc, row) => {
       if (row.status === 'completed') acc.completed += 1;
       if (row.status === 'failed' && !row.unreachable_type) acc.failed += 1;
@@ -159,6 +166,45 @@ async function syncStatsFromDatabase() {
     return state.stats;
   }
 }
+
+// ---------------------------------------------------------------------------
+// EGRESS-OPTS: Supabase byte-saving switches. Single tuning surface — every
+// optimized read/write below references these, and every one emits a
+// dedicated log event (see EGRESS-LOG notes) so diagnostic bundles show the
+// new behavior working (or failing loudly) without guessing.
+// ---------------------------------------------------------------------------
+const EGRESS = {
+  // E1: columns the 15s task poll is allowed to read. Covers every task.*
+  // field consumed downstream (executeTask, claim log, scrape params).
+  pollCols: "id,contact_id,task_type,message_text,scheduled_at,retry_count,thread_id,campaign_id,user_id",
+  // E1: columns the 1-min unibox poll reads (rt.* downstream).
+  uniboxCols: "id,contact_id,thread_id,message_text",
+  // E2: contacts handle->id map TTL (was 60s) + unknown-handle refresh.
+  contactsTtlMs: 30 * 60_000,
+  // E3: account working-hours TTL (was 5 min). Fail-open unchanged.
+  hoursTtlMs: 6 * 3600_000,
+  // E8: stats history backstop — counts stay exact until a browser passes
+  // this many completed+failed rows, then stats_cap_hit fires (warn).
+  statsHistoryLimit: 10000,
+};
+
+// EGRESS-LOG: canary tripwire for narrowed polls. If PostgREST/RLS ever drops
+// a column the claim path reads, the narrowed row is unusable — log loudly
+// (error) and let the caller refetch select=*. A firing tripwire in a bundle
+// means "widen EGRESS.pollCols/uniboxCols", never silent breakage.
+function narrowGuard(row, cols, event) {
+  const missing = cols.filter((c) => !row || !(c in row));
+  if (missing.length) {
+    dlog(event, { missing }, "error");
+    return false;
+  }
+  return true;
+}
+
+// EGRESS-LOG: per-run collector batch counters, flushed as one collector_batch
+// line (reset after flush). Module scope: processCollectedMessages runs are
+// sequential on the alarm, so no interleaving.
+const _egressBatch = { seen: 0, replied: 0, canceled: 0 };
 
 // ---------------------------------------------------------------------------
 // Supabase REST Client
@@ -185,12 +231,18 @@ async function fetchWithRetry(url, options, attempts = 2) {
   }
 }
 
-async function supabaseReq(path, method = "GET", body = null, _retried = false) {
+async function supabaseReq(path, method = "GET", body = null, _retried = false, opts = null) {
+  // EGRESS-E0: PATCH writes default to return=minimal (no response body) —
+  // every PATCH call site in this file was audited: only settle (266),
+  // unibox claim/completion/quarantine (821/878/887) and cancel (1225) read
+  // the returned rows, and those pass { representation: true }. POST/GET keep
+  // return=representation (target_lists + sync_unibox_thread consume rows).
+  const _minimal = method === "PATCH" && !(opts && opts.representation);
   const headers = {
     "apikey": SUPABASE_ANON_KEY,
     "Authorization": `Bearer ${state.accessToken ? state.accessToken : SUPABASE_ANON_KEY}`,
     "Content-Type": "application/json",
-    "Prefer": "return=representation"
+    "Prefer": _minimal ? "return=minimal" : "return=representation"
   };
   const options = { method, headers };
   if (body) options.body = JSON.stringify(body);
@@ -199,24 +251,29 @@ async function supabaseReq(path, method = "GET", body = null, _retried = false) 
   if (res.status === 401 && !_retried && state.refreshToken) {
     debugLog("Token expired, refreshing...");
     const refreshed = await refreshAccessTokenSingleFlight();
-    if (refreshed) return supabaseReq(path, method, body, true);
+    if (refreshed) return supabaseReq(path, method, body, true, opts);
   }
   if (!res.ok) {
     const bodyText = await res.text().catch(() => '');
     throw new Error(`Supabase error: ${res.status} ${res.statusText}${bodyText ? ` | ${bodyText.slice(0, 200)}` : ''}`);
   }
+  if (_minimal) return null; // 204 No Content — callers must not read rows.
   return res.json();
 }
 
 // Upsert (POST ...?on_conflict=...) with merge-duplicates. Used for the new
 // per-account `contact_account_outreach` table so re-sending state for the same
 // (contact, browser) pair updates instead of erroring on the unique constraint.
-async function supabaseUpsert(path, body, onConflict, _retried = false) {
+async function supabaseUpsert(path, body, onConflict, _retried = false, opts = null) {
+  // EGRESS-E0: upserts default to return=minimal (callers: caoUpsert ignores
+  // rows). The browser_instances pairing upsert passes { representation: true }
+  // because it reads rows[0].id/label.
+  const _minimal = !(opts && opts.representation);
   const headers = {
     "apikey": SUPABASE_ANON_KEY,
     "Authorization": `Bearer ${state.accessToken ? state.accessToken : SUPABASE_ANON_KEY}`,
     "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates,return=representation"
+    "Prefer": _minimal ? "resolution=merge-duplicates,return=minimal" : "resolution=merge-duplicates,return=representation"
   };
   const res = await fetchWithRetry(`${SUPABASE_URL}/rest/v1/${path}?on_conflict=${onConflict}`, {
     method: "POST", headers, body: JSON.stringify(body)
@@ -224,12 +281,13 @@ async function supabaseUpsert(path, body, onConflict, _retried = false) {
   if (res.status === 401 && !_retried && state.refreshToken) {
     debugLog("Token expired, refreshing...");
     const refreshed = await refreshAccessTokenSingleFlight();
-    if (refreshed) return supabaseUpsert(path, body, onConflict, true);
+    if (refreshed) return supabaseUpsert(path, body, onConflict, true, opts);
   }
   if (!res.ok) {
     const bodyText = await res.text().catch(() => '');
     throw new Error(`Supabase upsert error: ${res.status} ${res.statusText}${bodyText ? ` | ${bodyText.slice(0, 200)}` : ''}`);
   }
+  if (_minimal) return null;
   return res.json();
 }
 
@@ -257,6 +315,31 @@ async function caoUpsert(contactId, fields) {
   }
 }
 
+// EGRESS-E4: batched dual-write — one upsert call per 50-chunk instead of N
+// single-row upserts. Array body = single PostgREST call; E0-minimal applies
+// automatically (return ignored). Same non-fatal contract as caoUpsert.
+async function caoUpsertMany(entries) {
+  try {
+    if (!entries?.length || !state.browserId) return;
+    const userId = getUserIdFromToken(state.accessToken);
+    if (!userId) return;
+    const now = new Date().toISOString();
+    await supabaseUpsert(
+      "contact_account_outreach",
+      entries.map(({ contactId, fields }) => ({
+        user_id: userId,
+        contact_id: contactId,
+        browser_instance_id: state.browserId,
+        updated_at: now,
+        ...fields
+      })),
+      "contact_id,browser_instance_id"
+    );
+  } catch (err) {
+    debugLog(`[CAO] batched dual-write failed (non-fatal): ${err.message}`);
+  }
+}
+
 // A send can finish after executeTask's listener timed out. In that case the
 // normal pollTasks success path never runs, so settle both the task and the
 // contact here. This is deliberately limited to the fail-closed
@@ -266,7 +349,9 @@ async function settleLateVerifiedDelivery(taskId) {
   const rows = await supabaseReq(
     `dm_tasks?id=eq.${taskId}&status=eq.failed&error_reason=like.delivery_unknown*`,
     "PATCH",
-    { status: "completed", completed_at: completedAt, error_reason: null }
+    { status: "completed", completed_at: completedAt, error_reason: null },
+    false,
+    { representation: true } // EGRESS-E0 opt-out: rows?.[0] below reads contact_id/type.
   );
   const task = rows?.[0];
   if (!task) return false;
@@ -402,12 +487,17 @@ async function init() {
   if (data.additionalTabId) state.additionalTabId = data.additionalTabId;
 
   // Heartbeat runs 24/7 — even when paused — so the web app knows the browser is online.
-  // Clear any stale leaseExpiresAt so the first write after restart always goes through,
-  // preventing browsers from showing Offline after a reload or DB migration.
+  // NOTE (Sep-09 fix): do NOT wipe leaseExpiresAt or force-send here. Under MV3
+  // this init block re-runs on every alarm wake (~1/min), so wiping turned the
+  // 10-min lease into a send-every-minute (~200 PATCHes/day/browser) plus
+  // same-second doubles racing the alarm handler. The skip-checked send below
+  // covers every case: first boot (no lease → sends), restart in-window
+  // (lease valid → skips, DB still shows Online from the last write), restart
+  // after expiry (sends). The force-send stays only in autoPairBrowser, where
+  // a brand-new pairing genuinely needs immediate presence.
   if (state.browserId) {
     chrome.alarms.create("engine_heartbeat", { periodInMinutes: 1 });
-    await chrome.storage.local.remove('leaseExpiresAt');
-    sendHeartbeat(true).catch(() => { });
+    sendHeartbeat(false).catch(() => { });
   }
 
   if (await isEnginePaused(data)) {
@@ -602,7 +692,9 @@ async function _autoPairBrowserInner() {
         instance_key: myKey,
         status: "active",
       },
-      "user_id,instance_key"
+      "user_id,instance_key",
+      false,
+      { representation: true } // EGRESS-E0 opt-out: rows[0].id/label below.
     );
 
     if (rows && rows.length > 0) {
@@ -807,11 +899,19 @@ async function pollUniboxReplies() {
       debugLog(`[Unibox] expired ${stale.length} stale reply task(s).`);
     }
 
-    // 1. Claim the oldest due reply (FIFO)
+    // 1. Claim the oldest due reply (FIFO). EGRESS-E1: narrowed columns —
+    // the claim path reads id/contact_id/thread_id/message_text only.
     const due = await supabaseReq(
-      `dm_tasks?select=*&browser_instance_id=eq.${state.browserId}&task_type=eq.unibox_reply&status=eq.pending&or=(scheduled_at.is.null,scheduled_at.lte.${nowIso})&order=created_at.asc&limit=1`
+      `dm_tasks?select=${EGRESS.uniboxCols}&browser_instance_id=eq.${state.browserId}&task_type=eq.unibox_reply&status=eq.pending&or=(scheduled_at.is.null,scheduled_at.lte.${nowIso})&order=created_at.asc&limit=1`
     );
     if (!due || due.length === 0) return;
+    if (!narrowGuard(due[0], EGRESS.uniboxCols.split(","), "unibox_narrow_missing_col")) {
+      const full = await supabaseReq(
+        `dm_tasks?select=*&browser_instance_id=eq.${state.browserId}&task_type=eq.unibox_reply&status=eq.pending&or=(scheduled_at.is.null,scheduled_at.lte.${nowIso})&order=created_at.asc&limit=1`
+      );
+      if (!full || full.length === 0) return;
+      due[0] = full[0];
+    }
     const rt = due[0];
 
     _uniboxInFlight = true;
@@ -821,7 +921,7 @@ async function pollUniboxReplies() {
       const claimed = await supabaseReq(`dm_tasks?id=eq.${rt.id}&status=eq.pending`, "PATCH", {
         status: "processing",
         claimed_at: nowIso
-      });
+      }, false, { representation: true }); // EGRESS-E0 opt-out: claimed?.length is the lock proof.
       if (!claimed?.length) {
         dlog("unibox_claim_lost", { taskId: rt.id }, "warn");
         return;
@@ -879,7 +979,7 @@ async function pollUniboxReplies() {
           status: "completed",
           completed_at: completedAt,
           error_reason: null
-        });
+        }, false, { representation: true }); // EGRESS-E0 opt-out: completed?.length proves terminality.
         if (!completed?.length) throw new Error("completion update affected no processing row");
       } catch (e) {
         const reason = `delivery_confirmed_bookkeeping_failed: ${String(e?.message || e).slice(0, 180)}`;
@@ -888,7 +988,7 @@ async function pollUniboxReplies() {
             status: "failed",
             completed_at: completedAt,
             error_reason: reason
-          });
+          }, false, { representation: true }); // EGRESS-E0 opt-out: quarantined?.length proves terminality.
           if (!quarantined?.length) throw new Error("terminal quarantine affected no processing row");
           dlog("unibox_delivery_quarantined", { taskId: rt.id, reason }, "error");
           debugLog(`[Unibox] delivery was verified but completion bookkeeping failed; task quarantined: ${reason}`);
@@ -1004,7 +1104,7 @@ function normalizeIgTimestampMs(v) {
   return t < 1e12 ? null : String(t);
 }
 
-// contacts lookup cache (60s) — one query per browser per minute, max
+// contacts lookup cache — memory first, chrome.storage second (below).
 let _uniboxContactsCache = { at: 0, userId: null, map: new Map() };
 
 async function uniboxResolveContext() {
@@ -1014,18 +1114,20 @@ async function uniboxResolveContext() {
   );
   const row = rows && rows[0];
   if (!row?.user_id) throw new Error("paired row missing user_id");
+  // EGRESS-E2b: hydrate from persisted cache. Worker memory dies on every
+  // service-worker restart (~1/min under MV3), which used to force a full
+  // refetch each time (Sep-10 bundle: 382 refreshes). Storage survives.
+  if (!_uniboxContactsCache.at) {
+    await hydrateUniboxContactsCache(row.user_id).catch(() => {});
+  }
+  // EGRESS-E2: contacts handle->id map. TTL 30 min (was 60s) — contacts
+  // barely change, and every refresh is logged below. Unknown handles force
+  // a refresh (see syncUniboxThreads) so longer TTL can never drop hot leads.
   if (
     _uniboxContactsCache.userId !== row.user_id ||
-    Date.now() - _uniboxContactsCache.at > 60000
+    Date.now() - _uniboxContactsCache.at > EGRESS.contactsTtlMs
   ) {
-    const contacts = await supabaseReq(
-      `contacts?select=id,username&user_id=eq.${row.user_id}`
-    );
-    const map = new Map();
-    for (const c of contacts || []) {
-      map.set(String(c.username || "").toLowerCase(), c.id);
-    }
-    _uniboxContactsCache = { at: Date.now(), userId: row.user_id, map };
+    await refreshUniboxContactsMap(row.user_id, _uniboxContactsCache.userId !== row.user_id ? "user-change" : "ttl");
   }
   return {
     userId: row.user_id,
@@ -1036,23 +1138,134 @@ async function uniboxResolveContext() {
   };
 }
 
+// EGRESS-E2/EGRESS-LOG: (re)fetch the contacts map. Every refresh logs
+// contacts_map_refresh {reason, rows} — in a bundle, ~48/day at 30-min TTL
+// vs ~1440/day at 60s TTL is the saving made visible. Reasons: boot (empty
+// cache), ttl, user-change, unknown-handle (safety refresh, must never be
+// absent when hot leads are missed).
+async function refreshUniboxContactsMap(userId, reason) {
+  const contacts = await supabaseReq(
+    `contacts?select=id,username&user_id=eq.${userId}`
+  );
+  const map = new Map();
+  for (const c of contacts || []) {
+    map.set(String(c.username || "").toLowerCase(), c.id);
+  }
+  _uniboxContactsCache = { at: Date.now(), userId, map };
+  // Any full refresh makes negative entries stale (fresh data may resolve
+  // them) — the caller re-records a miss below if still unknown.
+  _unknownHandleCache.clear();
+  // EGRESS-E2b: persist so the map (and negcache) survive worker restarts.
+  // Best-effort: storage failure just means next boot refetches (old behavior).
+  try {
+    await chrome.storage.local.set({ uniboxContactsCache: {
+      at: _uniboxContactsCache.at, userId,
+      entries: [...map].slice(0, 5000),
+      misses: [..._unknownHandleCache].slice(0, 500),
+    } });
+  } catch (_e) {
+    debugLog(`[Unibox] contacts cache persist failed (non-fatal): ${_e?.message || _e}`);
+  }
+  dlog("contacts_map_refresh", { reason, rows: map.size });
+  return map;
+}
+
+// EGRESS-E2b: restore persisted map + negcache. Validates owner + TTL —
+// a row for another user or older than TTL is ignored (falls through to a
+// logged refresh). Emits contacts_map_restored so bundles prove the save.
+async function hydrateUniboxContactsCache(userId) {
+  const stored = await chrome.storage.local.get("uniboxContactsCache");
+  const c = stored && stored.uniboxContactsCache;
+  if (!c || c.userId !== userId || typeof c.at !== "number") return false;
+  if (Date.now() - c.at > EGRESS.contactsTtlMs) return false;
+  if (!Array.isArray(c.entries)) return false;
+  const map = new Map();
+  for (const e of c.entries) {
+    if (Array.isArray(e) && typeof e[0] === "string") map.set(e[0], e[1]);
+  }
+  _uniboxContactsCache = { at: c.at, userId, map };
+  _unknownHandleCache.clear();
+  if (Array.isArray(c.misses)) {
+    for (const [h, ts] of c.misses) {
+      if (typeof h === "string" && typeof ts === "number" && Date.now() - ts < EGRESS.contactsTtlMs) {
+        _unknownHandleCache.set(h, ts);
+      }
+    }
+  }
+  dlog("contacts_map_restored", { rows: map.size, ageMin: Math.round((Date.now() - c.at) / 60000), misses: _unknownHandleCache.size });
+  return true;
+}
+
+// EGRESS-E2 negative cache: handles that missed even after a forced refresh
+// (strangers, groups, spam — threads that can never resolve). Without this,
+// the unknown-handle safety net refetches the full map on EVERY sync for the
+// same unresolvable threads (Sep-09 bundle: 35 refetches in 12 min).
+const _unknownHandleCache = new Map(); // handle -> first-miss-at
+
+// True if an unknown handle deserves a forced refresh: never seen, or its
+// miss is older than the map TTL. Repeat sightings inside the window skip
+// silently (logged once at insert by noteUnknownHandle below).
+function unknownHandleNeedsRefresh(handle) {
+  const missAt = _unknownHandleCache.get(handle);
+  if (missAt && Date.now() - missAt < EGRESS.contactsTtlMs) return false;
+  return true;
+}
+
+function noteUnknownHandle(handle, resolved) {
+  if (resolved) { _unknownHandleCache.delete(handle); return; }
+  // First-miss timestamp is FIXED (never re-stamped): the window must expire
+  // on its own, or a contact added mid-window would be skipped indefinitely
+  // by an ever-sliding expiry.
+  if (!_unknownHandleCache.has(handle)) {
+    dlog("unknown_handle_skipped", { handle });
+    _unknownHandleCache.set(handle, Date.now());
+  }
+}
+
+// Module-scope run counter for the hourly sync heartbeat (declared before
+// use; alarms fire sequentially so no interleave).
+let _uniboxSyncRuns = 0;
+
 async function syncUniboxThreads(data) {
   const ctx = await uniboxResolveContext();
   const threads = data?.threads || {};
+  // UNIBOX-OBS: per-run outcome counters. Every filter below used to skip
+  // silently, which made missing threads undiagnosable (Sep-09: cristiano's
+  // thread never synced, zero trace). The summary at the end names the
+  // culprit outright. Runs with zero activity stay silent except every 30th
+  // run (~hourly heartbeat) so pure-idle stretches remain visible.
+  const _sum = { total: 0, synced: 0, notContact: 0, badShape: 0, group: 0, stale: 0, failed: 0, notContactSample: [] };
   for (const [targetUsername, info] of Object.entries(threads)) {
+    _sum.total++;
     try {
       const handle = String(targetUsername || "").toLowerCase();
-      const contactId = ctx.contacts.get(handle) || null;
-      // campaign-lead filter: only threads belonging to known contacts
-      if (!contactId) continue;
-      if (!info?.thread_key || !Array.isArray(info.messages)) continue;
+      let contactId = ctx.contacts.get(handle) || null;
+      // EGRESS-E2 safety: with a 30-min map TTL, a freshly added contact's
+      // thread would be skipped for up to 30 min. Refresh once on unknown
+      // handle before giving up — the refresh itself is logged. Repeat
+      // misses inside the TTL window skip via negative cache (no refetch).
+      if (!contactId) {
+        if (unknownHandleNeedsRefresh(handle)) {
+          try {
+            const fresh = await refreshUniboxContactsMap(ctx.userId, "unknown-handle");
+            contactId = fresh.get(handle) || null;
+          } catch (_) { /* fall through to skip below */ }
+        }
+        noteUnknownHandle(handle, !!contactId);
+        if (!contactId) {
+          _sum.notContact++;
+          if (_sum.notContactSample.length < 3) _sum.notContactSample.push(handle || "(empty)");
+          continue;
+        }
+      }
+      if (!info?.thread_key || !Array.isArray(info.messages)) { _sum.badShape++; continue; }
 
       // group guard (v2 §5.4): >1 distinct non-account sender = group chat
       const participantSenders = new Set(
         info.messages.map(m => String(m.username || "").toLowerCase())
       );
       if (ctx.accountUsername) participantSenders.delete(ctx.accountUsername);
-      if (participantSenders.size > 1) continue;
+      if (participantSenders.size > 1) { _sum.group++; continue; }
 
       // watermark: push only messages newer than last successful sync
       const wmKey = `wm:${state.browserId}:${info.thread_key}`;
@@ -1076,7 +1289,7 @@ async function syncUniboxThreads(data) {
           ts_ms: Number(ts)
         });
       }
-      if (!fresh.length) continue; // idle thread costs nothing
+      if (!fresh.length) { _sum.stale++; continue; } // idle thread costs nothing
 
       fresh.sort((a, b) => a.ts_ms - b.ts_ms);
       const windowed = fresh.slice(-30); // rolling window cap
@@ -1131,11 +1344,20 @@ async function syncUniboxThreads(data) {
       const out = Array.isArray(res) ? res[0] : res;
       const newWm = Number(out?.watermark_ms || 0);
       if (newWm > 0) await chrome.storage.local.set({ [wmKey]: newWm });
+      _sum.synced++;
       debugLog(`[Unibox] synced @${targetUsername}: ${windowed.length} msg(s), wm=${newWm}`);
     } catch (e) {
       // one bad thread must never abort the rest of the dump
+      _sum.failed++;
       debugLog(`[Unibox] thread ${targetUsername} failed: ${e.message}`);
     }
+  }
+  // UNIBOX-OBS summary: log on any activity, plus every 30th run as an
+  // hourly heartbeat so pure-idle stretches stay distinguishable from a
+  // dead sync loop. _uniboxSyncRuns is module scope (alarms are sequential).
+  _uniboxSyncRuns++;
+  if (_sum.synced || _sum.failed || _sum.notContact || _sum.badShape || _sum.group || _uniboxSyncRuns % 30 === 0) {
+    dlog("unibox_sync_summary", { ..._sum, run: _uniboxSyncRuns });
   }
 }
 
@@ -1175,15 +1397,16 @@ async function processCollectedMessages(readReceipts) {
         );
         // Dual-write per-account seen state. The seen/reply came from THIS
         // browser's logged-in IG account, so it belongs to (contact, thisBrowser).
+        // EGRESS-E4: one batched upsert per chunk instead of N single-row calls.
         try {
           const seenContacts = await supabaseReq(`contacts?select=id&username=in.(${inQuery})`);
-          for (const c of (seenContacts || [])) {
-            await caoUpsert(c.id, { media_seen: true, media_seen_at: new Date().toISOString() });
-          }
+          const _now = new Date().toISOString();
+          await caoUpsertMany((seenContacts || []).map(c => ({ contactId: c.id, fields: { media_seen: true, media_seen_at: _now } })));
         } catch (e) {
           debugLog(`[CAO] seen dual-write failed (non-fatal): ${e.message}`);
         }
       }
+      _egressBatch.seen += userList.length;
     }
 
     // Leads who replied: proactively cancel their remaining follow-ups so we never
@@ -1194,21 +1417,56 @@ async function processCollectedMessages(readReceipts) {
         const chunk = repliedList.slice(i, i + 50);
         const inQuery = chunk.map(u => `"${u}"`).join(",");
         const contacts = await supabaseReq(`contacts?select=id&username=in.(${inQuery})`);
-        for (const contact of (contacts || [])) {
-          // Persist the reply (global + per-account) so the scheduler stops
-          // generating ghost follow-ups for this lead. NOT media_seen — this is
-          // a genuine reply detected from the Relay store.
+        // EGRESS-E4: one replied-PATCH per chunk (was N per-contact PATCHes),
+        // one batched dual-write, one batched cancel. Same semantics, 3 calls
+        // per chunk regardless of chunk size.
+        const _ids = (contacts || []).map(c => c.id).filter(Boolean);
+        if (_ids.length) {
+          const _now = new Date().toISOString();
           try {
-            await supabaseReq(`contacts?id=eq.${contact.id}`, "PATCH",
-              { replied: true, replied_at: new Date().toISOString() });
+            await supabaseReq(`contacts?id=in.(${_ids.join(",")})`, "PATCH",
+              { replied: true, replied_at: _now });
           } catch (e) { debugLog(`[Replied] global persist failed (non-fatal): ${e.message}`); }
-          await caoUpsert(contact.id, { replied: true, replied_at: new Date().toISOString() });
-          await cancelPendingFollowups(contact.id, "lead_replied");
+          await caoUpsertMany(_ids.map(id => ({ contactId: id, fields: { replied: true, replied_at: _now } })));
+          _egressBatch.canceled += await cancelPendingFollowupsMany(_ids, "lead_replied");
         }
+        _egressBatch.replied += _ids.length;
       }
+    }
+    // EGRESS-LOG: per-run batch summary — in a bundle this line replaces N
+    // per-contact write logs. Zero-activity runs stay silent (no spam).
+    if (_egressBatch.seen || _egressBatch.replied || _egressBatch.canceled) {
+      dlog("collector_batch", { ..._egressBatch });
+      _egressBatch.seen = 0; _egressBatch.replied = 0; _egressBatch.canceled = 0;
     }
   } catch (err) {
     debugLog(`[Collector] Error processing collected messages: ${err.message}`);
+  }
+}
+
+// Cancel any still-pending follow-up tasks for a batch of contacts.
+// EGRESS-E4 companion to cancelPendingFollowups: one IN() PATCH per call
+// instead of one per contact. Same pending-only + browser-scoped semantics;
+// representation kept (E0 opt-out) because the length is the cancel count.
+async function cancelPendingFollowupsMany(contactIds, reason) {
+  if (!contactIds?.length) return 0;
+  try {
+    const browserFilter = state.browserId ? `&browser_instance_id=eq.${state.browserId}` : "";
+    const cancelled = await supabaseReq(
+      `dm_tasks?contact_id=in.(${contactIds.join(",")})&status=eq.pending&task_type=like.followup_*${browserFilter}`,
+      "PATCH",
+      { status: "skipped", error_reason: reason },
+      false,
+      { representation: true }
+    );
+    const count = Array.isArray(cancelled) ? cancelled.length : 0;
+    if (count > 0) {
+      debugLog(`[Collector] Cancelled ${count} pending follow-up(s) for ${contactIds.length} contact(s) (${reason}).`);
+    }
+    return count;
+  } catch (err) {
+    debugLog(`[Collector] Error batch-cancelling follow-ups: ${err.message}`);
+    return 0;
   }
 }
 
@@ -1223,7 +1481,9 @@ async function cancelPendingFollowups(contactId, reason) {
     const cancelled = await supabaseReq(
       `dm_tasks?contact_id=eq.${contactId}&status=eq.pending&task_type=like.followup_*${browserFilter}`,
       "PATCH",
-      { status: "skipped", error_reason: reason }
+      { status: "skipped", error_reason: reason },
+      false,
+      { representation: true } // EGRESS-E0 opt-out: length is the cancel count.
     );
     const count = Array.isArray(cancelled) ? cancelled.length : 0;
     if (count > 0) {
@@ -1323,7 +1583,9 @@ function hourInZone(tz) {
 // Account-level defaults from user_settings. Returns null when unconfigured or
 // when the fetch fails (fail open). Cached in memory only; force bypasses.
 async function getAccountHours(force = false) {
-  if (!force && _workHoursCache && Date.now() - _workHoursCache.fetchedAt < 5 * 60_000) {
+  // EGRESS-E3: TTL 6h (was 5 min). Fail-open unchanged — a stale window only
+  // risks running outside hours, never stalling (clamp sleeps, never blocks).
+  if (!force && _workHoursCache && Date.now() - _workHoursCache.fetchedAt < EGRESS.hoursTtlMs) {
     return _workHoursCache.value;
   }
   try {
@@ -1337,7 +1599,9 @@ async function getAccountHours(force = false) {
       tz: s?.timezone && timeZoneIsValid(s.timezone) ? s.timezone : browserTimeZone()
     };
     _workHoursCache = { fetchedAt: Date.now(), value };
-    dlog("account_hours_loaded", { start: value.start, end: value.end, tz: value.tz });
+    // EGRESS-LOG: ttl marker makes the 6h cadence visible in bundles
+    // (account_hours_loaded should appear ~4/day, not ~288/day).
+    dlog("account_hours_loaded", { start: value.start, end: value.end, tz: value.tz, ttl: "6h" });
     return value;
   } catch (err) {
     // Fail open + be loud about it — this exact silent path caused a full-day stall.
@@ -1550,9 +1814,16 @@ async function pollTasks() {
     // 1. Fetch a pending task that is due now (scheduled_at <= now OR scheduled_at IS NULL)
     // NULL scheduled_at = old task generated before centralized pacing = "due now"
     // Campaign embed carries the hours this specific task must obey (per-campaign clamp).
+    // EGRESS-E1: narrowed columns — audited against every task.* read downstream
+    // (executeTask, claim log, scrape params). Tripwire below refetches select=*
+    // if a column ever goes missing, so narrowing can never silently break sends.
     const nowIso = new Date().toISOString();
-    const url = `dm_tasks?select=*,campaigns!inner(id,status,working_hours_enabled,work_start_hour,work_end_hour)&browser_instance_id=eq.${state.browserId}&status=eq.pending&campaigns.status=eq.active&or=(scheduled_at.is.null,scheduled_at.lte.${nowIso})&order=scheduled_at.asc.nullslast,created_at.asc&limit=1`;
-    const tasks = await supabaseReq(url);
+    const url = `dm_tasks?select=${EGRESS.pollCols},campaigns!inner(id,status,working_hours_enabled,work_start_hour,work_end_hour)&browser_instance_id=eq.${state.browserId}&status=eq.pending&campaigns.status=eq.active&or=(scheduled_at.is.null,scheduled_at.lte.${nowIso})&order=scheduled_at.asc.nullslast,created_at.asc&limit=1`;
+    let tasks = await supabaseReq(url);
+
+    if (tasks && tasks.length > 0 && !narrowGuard(tasks[0], EGRESS.pollCols.split(","), "poll_narrow_missing_col")) {
+      tasks = await supabaseReq(`dm_tasks?select=*,campaigns!inner(id,status,working_hours_enabled,work_start_hour,work_end_hour)&browser_instance_id=eq.${state.browserId}&status=eq.pending&campaigns.status=eq.active&or=(scheduled_at.is.null,scheduled_at.lte.${nowIso})&order=scheduled_at.asc.nullslast,created_at.asc&limit=1`);
+    }
 
     if (!tasks || tasks.length === 0) {
       // Nothing due — find the next future scheduled_at so we sleep until then
@@ -1611,7 +1882,17 @@ async function pollTasks() {
       }
     }
 
-    await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", { status: "processing", claimed_at: new Date().toISOString() });
+    // FIX-DBLCLAIM: conditional claim (atomic test-and-set). The Sep-08 bundle
+    // shows the same task claimed twice 1s apart: two overlapping poll runs
+    // both fetched it as pending, and the old unconditional PATCH let both
+    // succeed — risking a double-DM. With &status=eq.pending, the loser gets
+    // zero rows and walks away. Same pattern as the unibox claim below.
+    // Representation opt-out required: claimed?.length IS the lock proof.
+    const claimedTask = await supabaseReq(`dm_tasks?id=eq.${task.id}&status=eq.pending`, "PATCH", { status: "processing", claimed_at: new Date().toISOString() }, false, { representation: true });
+    if (!claimedTask?.length) {
+      dlog("claim_lost_race", { taskId: task.id, taskType: task.task_type }, "warn");
+      return;
+    }
     // E-01 Part 2 FIX: persist the in-flight task ID so a revived worker can
     // check whether a task is still running before stealing the lock.
     await chrome.storage.local.set({ inFlightTaskId: task.id });
@@ -2047,7 +2328,7 @@ function usableFullName(contact) {
 async function persistResolvedFullName(task, resolvedFullName) {
   if (!resolvedFullName || !task?.contact_id) return false;
   try {
-    const storedFull = (task.contacts?.full_name || "").trim();
+    const storedFull = (task.contacts?.full_name || "").replace(/^@+/, "").trim();
     const storedUser = (task.contacts?.username || "").replace(/^@/, "").trim().toLowerCase();
     const isPlaceholder = !storedFull || storedFull.toLowerCase() === storedUser;
     const newFull = String(resolvedFullName).trim();
@@ -2991,10 +3272,43 @@ async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) 
 
     if (!pingOk) {
       reloadCount++;
+      // FIX-DEADTAB: the Sep-08 bundle shows this ladder firing reloads on an
+      // already-closed tab ("No tab with id"). Verify the tab exists first.
+      const _alive = await chrome.tabs.get(tabId).catch(() => null);
+      if (!_alive) {
+        dlog("tab_gone_before_reload", { taskType, tabId, attempt: reloadCount }, "warn");
+        break;
+      }
       debugLog(`Content script not responding. Reloading tab (attempt ${reloadCount}/2)...`);
       dlog("cs_unresponsive_reload", { taskType, tabId, attempt: reloadCount }, "warn");
       await chrome.tabs.reload(tabId, { bypassCache: true });
       await sleep(8000); // Wait for load
+    }
+  }
+
+  if (!pingOk) {
+    // FIX-DEADTAB: a tab parked outside the DM flow (e.g. instagram.com home)
+    // can never satisfy a ping no matter how often it is reloaded. Navigate it
+    // to the inbox once and re-ping before declaring it dead.
+    const _placed = await chrome.tabs.get(tabId).catch(() => null);
+    if (_placed && _placed.url && _placed.url.includes("instagram.com") && !_placed.url.includes("/direct/")) {
+      dlog("tab_misplaced_navigate", { taskType, tabId, url: _placed.url }, "warn");
+      try {
+        await chrome.tabs.update(tabId, { url: "https://www.instagram.com/direct/inbox/" });
+        await sleep(10000);
+        for (let i = 0; i < 5 && !pingOk; i++) {
+          try {
+            await chrome.tabs.sendMessage(tabId, {
+              type: "adblock:info:to-content",
+              data: { type: "ping", data: {} }
+            });
+            pingOk = true;
+            break;
+          } catch (e) {
+            await sleep(2000);
+          }
+        }
+      } catch (_) { /* fall through to dead handling below */ }
     }
   }
 
@@ -3086,6 +3400,11 @@ async function sendToContentLite(tabType, taskType, taskData) {
 // ---------------------------------------------------------------------------
 // Listeners
 // ---------------------------------------------------------------------------
+// TAKEOVER-BACKOFF store: handle -> backoff-until timestamp. Module scope so
+// the registerAccounts handler below shares it across invocations (declared
+// here, before the listener, so it exists before any message can arrive).
+const _takeoverBackoff = {};
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "HUB_LOGIN") {
     handleLogin(message.payload.email, message.payload.password).catch(err => debugLog(`Login error: ${err.message}`));
@@ -3299,6 +3618,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // With UNIQUE(user_id, instance_key), the row we hold IS ours by definition,
     // so there's no split-brain check anymore. We just make sure a row exists
     // (create-or-adopt), then claim/refresh the IG username via the atomic RPC.
+    //
+    // TAKEOVER-BACKOFF (module scope map below): when the RPC refuses with
+    // takeover_blocked_live (handle alive on another live browser), we record
+    // a 6h per-handle backoff and answer subsequent attempts locally WITHOUT
+    // network or log spam. Content's retry loop (3 min per tab init) then burns
+    // ~36 local no-ops instead of hammering a call the server will refuse.
+    // The extension never passes p_force — only a future dashboard confirm may.
     if (taskType === "registerAccounts") {
       (async () => {
         try {
@@ -3328,15 +3654,62 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                   debugLog(`[IG Detect] Detected logged-in IG account: @${igUsername}`);
                 }
 
+                // Takeover backoff: a live-elsewhere refusal parks this handle
+                // for 6h (no network, no spam). Expired entries are lazy-swept.
+                if ((_takeoverBackoff[igUsername] || 0) > Date.now()) {
+                  throw new Error(`takeover_blocked_live: backoff active for @${igUsername} (another live browser holds it)`);
+                }
+                for (const _h of Object.keys(_takeoverBackoff)) {
+                  if (_takeoverBackoff[_h] <= Date.now()) delete _takeoverBackoff[_h];
+                }
+
                 // Atomic RPC: if another (stale) row of THIS user owns this IG
                 // account, it transfers campaigns/limits/outreach/pending tasks
                 // to our row, frees the stale row (ig_username NULL, inactive),
                 // then stamps our row. This is the PC→laptop takeover path.
-                const rpcResult = await supabaseReq(`rpc/pair_or_adopt_ig_username`, "POST", {
-                  p_new_browser_id: state.browserId,
-                  p_ig_username: igUsername,
-                  p_ig_user_id: igUserId,
-                });
+                // p_force is never passed: only a dashboard confirm may override
+                // a live-elsewhere refusal (server default false).
+                let rpcResult;
+                try {
+                  rpcResult = await supabaseReq(`rpc/pair_or_adopt_ig_username`, "POST", {
+                    p_new_browser_id: state.browserId,
+                    p_ig_username: igUsername,
+                    p_ig_user_id: igUserId,
+                  });
+                } catch (_rpcErr) {
+                  const _msg = String(_rpcErr?.message || _rpcErr);
+                  if (/takeover_blocked_live/.test(_msg)) {
+                    _takeoverBackoff[igUsername] = Date.now() + 6 * 3600_000;
+                    debugLog(`[IG Detect] Takeover refused — @${igUsername} is live on another browser; backing off 6h (no ping-pong).`);
+                    throw _rpcErr;
+                  }
+                  // GHOST-ROW recovery: our cached browserId points at a row
+                  // that no longer belongs to us (deleted from the dashboard,
+                  // or paired under a different login). ensurePairedRow() trusts
+                  // the cache so it never recovers — do it here: drop the stale
+                  // identity, re-pair fresh under the current token, retry once.
+                  // Without this the worker polls zero tasks and fails every
+                  // registerAccounts forever (Sep-09: "not owned by caller"
+                  // every 5s + permanent "0 tasks at all").
+                  if (/not owned by caller/.test(_msg)) {
+                    debugLog(`[IG Detect] Cached row gone/foreign — clearing identity and re-pairing fresh.`);
+                    state.browserId = null;
+                    state.browserLabel = null;
+                    await chrome.storage.local.remove(["browserId", "browserLabel"]).catch(() => {});
+                    await autoPairBrowser().catch(() => {});
+                    if (state.browserId) {
+                      rpcResult = await supabaseReq(`rpc/pair_or_adopt_ig_username`, "POST", {
+                        p_new_browser_id: state.browserId,
+                        p_ig_username: igUsername,
+                        p_ig_user_id: igUserId,
+                      });
+                    } else {
+                      throw _rpcErr;
+                    }
+                  } else {
+                    throw _rpcErr;
+                  }
+                }
                 debugLog(`[IG Detect] RPC result: ${JSON.stringify(rpcResult)}`);
 
                 // Update the label to show the @handle
@@ -3441,4 +3814,23 @@ dlog("session_boot", {
   version: chrome.runtime.getManifest().version,
   browserId: state.browserId ? state.browserId.slice(0, 8) : null
 });
+// EGRESS-LOG: one line per boot declaring the active byte-saving switches,
+// so any bundle is self-describing about which optimizations were live.
+dlog("egress_opts", {
+  pollNarrow: EGRESS.pollCols,
+  uniboxNarrow: EGRESS.uniboxCols,
+  contactsTtlMin: EGRESS.contactsTtlMs / 60000,
+  hoursTtlH: EGRESS.hoursTtlMs / 3600000,
+  minimalWrites: true,
+  collectorBatch: true,
+  statsLimit: EGRESS.statsHistoryLimit
+});
+// Eager instance_key mint: generating the key lazily at pairing leaves a
+// kill-window (worker death between generate and persist mints a second key
+// next boot → ghost row). Minting at install/update shrinks it to ~zero;
+// the lazy path in ensureInstanceKey stays as fallback (function-declared,
+// hoisted, storage-only — safe this early).
+try {
+  chrome.runtime.onInstalled.addListener(() => { ensureInstanceKey().catch(() => {}); });
+} catch (_) {}
 init();

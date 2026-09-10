@@ -906,7 +906,13 @@
           // UNIBOX CAPTURE: new-stack (OffMsys) thread rows for accounts where
           // the MSYS ReStore tables no longer exist.
           this.innerDomConnector.registerTask("collectThreadFromDOM", () =>
-            this._collectThreadFromDOM()));
+            this._collectThreadFromDOM()),
+          // RELAY-NAME: local full_name lookup for template fill — zero network.
+          this.innerDomConnector.registerTask("getRelayUserByUsername", ({ username: e }) =>
+            this._getRelayUserByUsername(e)),
+          // RELAY-VERIFY: thread-scoped outgoing rows for send verification.
+          this.innerDomConnector.registerTask("getRelayThreadText", (e = {}) =>
+            this._getRelayThreadText(e)));
       }
       constructor(e) {
         ((this._tree = e), (this.innerDomConnector = new t()), this.registerTasks(), setTimeout(() => {}, 5e3));
@@ -2047,6 +2053,113 @@
         return this._getAllMessagesFromDOM().some(
           (e) => !0 === e.outgoing && e.text && e.timestamp_ms && Number(e.timestamp_ms) >= Number(t),
         );
+      }
+      // RELAY-NAME: find a lead's real name in the local Relay store
+      // (XDTUserDict / SlideUser / ShareSheetUser). Pure memory read — immune
+      // to 429/auth. Returns { full_name, username } or null on miss.
+      // A miss is NOT an error: the caller falls through to the network path,
+      // so this never throws for "not found" (terminal parking must never
+      // follow a cache miss).
+      async _getRelayUserByUsername(e) {
+        try {
+          const _username = String(e ?? "").trim().replace(/^@+/, "").toLowerCase();
+          if (!_username) return null;
+          const _env = this._getRelayEnv();
+          if (!_env) return null;
+          let _recs = null;
+          try { _recs = _env.getStore().getSource().toJSON(); } catch (_) { return null; }
+          if (!_recs) return null;
+          for (const _id of Object.keys(_recs)) {
+            const _r = _recs[_id];
+            if (!_r || typeof _r !== "object") continue;
+            const _t = _r.__typename;
+            if (_t !== "XDTUserDict" && _t !== "SlideUser" && _t !== "ShareSheetUser" && _r.full_name === undefined) continue;
+            if (String(_r.username ?? "").trim().replace(/^@+/, "").toLowerCase() !== _username) continue;
+            const _full = _r.full_name != null ? String(_r.full_name).trim() : "";
+            if (!_full) return null;
+            return { full_name: _full, username: String(_r.username).trim() };
+          }
+          return null;
+        } catch (_) { return null; }
+      }
+      // RELAY-VERIFY: thread-scoped outgoing rows for send verification.
+      // Returns { rows: [{mid, ts, text, outgoing}], tailId } or null when the
+      // store is unreachable/unreadable. Thread matched on any of thread_key /
+      // thread_fbid / thread_id (URL id == thread_key); without keys, rows are
+      // still freshness-filtered so a caller timestamp scopes the result.
+      // Text resolution skips __-keys and ref/id-shaped values (probe-proven).
+      async _getRelayThreadText({ threadKey, threadFbid, threadId, sinceMs } = {}) {
+        try {
+          const _env = this._getRelayEnv();
+          if (!_env) return null;
+          let _recs = null;
+          try { _recs = _env.getStore().getSource().toJSON(); } catch (_) { return null; }
+          if (!_recs) return null;
+          const _keys = [threadKey, threadFbid, threadId].filter((v) => v != null).map(String);
+          const _fbids = new Set();
+          // UNIBOX-BACKFILL: fbid->username for row attribution (group guard +
+          // is_own downstream need real usernames, not fbids).
+          const _names = {};
+          try {
+            const _ref = _recs["client:root:viewer"]?.xdt_user?.__ref;
+            const _u = _ref ? _recs[_ref] : null;
+            ["interop_messaging_user_fbid", "fbid_v2", "pk", "id"].forEach((k) => { if (_u?.[k] != null) _fbids.add(String(_u[k])); });
+            for (const _rid of Object.keys(_recs)) {
+              const _ur = _recs[_rid];
+              if (!_ur || typeof _ur !== "object" || _ur.username == null) continue;
+              const _t = _ur.__typename;
+              if (_t !== "XDTUserDict" && _t !== "SlideUser" && _t !== "ShareSheetUser") continue;
+              const _un = String(_ur.username).trim();
+              if (!_un) continue;
+              ["interop_messaging_user_fbid", "fbid_v2", "pk", "id"].forEach((k) => { if (_ur[k] != null) _names[String(_ur[k])] = _un; });
+            }
+          } catch (_) {}
+          const _isRef = (s) => /^(client:.*|mid\..*|\d{5,})$/.test(String(s ?? "").trim());
+          const _textOf = (r) => {
+            const _d = r.text_body != null ? String(r.text_body) : "";
+            if (_d.trim() && !_isRef(_d)) return _d;
+            const _hunt = (o, _depth) => {
+              if (!o || typeof o !== "object" || _depth > 3) return "";
+              const _ks = Object.keys(o).filter((k) => !k.startsWith("__"));
+              _ks.sort((a, b) => (/text/i.test(b) ? 1 : 0) - (/text/i.test(a) ? 1 : 0));
+              for (const _k of _ks.slice(0, 12)) {
+                try {
+                  const _v = o[_k];
+                  if (typeof _v === "string" && _v.trim() && !_isRef(_v)) return _v;
+                  if (_v && typeof _v === "object") {
+                    const _got = _hunt(_v.__ref ? _recs[_v.__ref] : _v, _depth + 1);
+                    if (_got) return _got;
+                  }
+                } catch (_) {}
+              }
+              return "";
+            };
+            try {
+              const _c = r.content, _ref2 = _c?.__ref ? _recs[_c.__ref] : null;
+              if (_ref2) return _hunt(_ref2, 0);
+            } catch (_) {}
+            return "";
+          };
+          const _since = Number(sinceMs ?? 0);
+          const _rows = [];
+          for (const _id of Object.keys(_recs)) {
+            const _r = _recs[_id];
+            if (!_r || typeof _r !== "object" || _r.__typename !== "SlideMessage") continue;
+            const _blob = [_id, _r.thread_fbid, _r.message_id].map((x) => String(x ?? "")).join("|");
+            if (_keys.length && !_keys.some((k) => k && _blob.includes(k))) continue;
+            const _ts = _r.timestamp_ms != null ? Number(_r.timestamp_ms) : null;
+            if (_ts == null || _ts < _since) continue;
+            const _tx = _textOf(_r);
+            if (!_tx.trim()) continue;
+            const _sender = _r.sender_fbid != null ? String(_r.sender_fbid) : null;
+            _rows.push({ mid: _r.message_id || null, ts: _ts, text: _tx.slice(0, 120),
+              outgoing: _sender ? (_fbids.size ? _fbids.has(_sender) : null) : null,
+              username: _sender && _names[_sender] ? _names[_sender] : null,
+              instagram_id: _sender });
+          }
+          _rows.sort((a, b) => a.ts - b.ts);
+          return { rows: _rows, tailId: _rows.length ? _rows[_rows.length - 1].mid : null };
+        } catch (_) { return null; }
       }
       // UNIBOX CAPTURE (ported from ColdDMs 26-Aug): aggregate live OffMsys
       // rows into the shape the content-side harvester expects. Guards
