@@ -1874,6 +1874,7 @@
                 senderId: m.sender_fbid ?? null,
                 timestampMs: m.timestamp_ms ?? null,
                 message_id: m.message_id || m.id || null,
+                messageId: m.message_id || m.id || null,
                 text: m.text_body ?? null,
                 outgoing,
                 threadKey: r.thread_key ?? null,

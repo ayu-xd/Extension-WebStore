@@ -419,7 +419,10 @@ class Instagram {
       // read degrades to that thread staying hollow, never stalls the capture.
       try {
         const _entries = t ? Object.entries(t) : [];
-        const _hollow = _entries.filter(([, info]) => info && info.thread_key && (!Array.isArray(info.messages) || !info.messages.length)).slice(0, 10);
+        const _usable = (info) => Array.isArray(info.messages) && info.messages.some(m =>
+          (m.messageId ?? m.message_id) && this._normalizeInstagramTimestampMs(m.timestampMs));
+        const _hollow = _entries.filter(([, info]) =>
+          info && info.thread_key && !_usable(info)).slice(0, 10);
         if (_hollow.length) {
           const _res = await Promise.allSettled(_hollow.map(([, info]) =>
             this.domConnector.send("getRelayThreadText", { threadKey: String(info.thread_key), sinceMs: 0 }, { timeoutMs: 15000 }).catch(() => null)

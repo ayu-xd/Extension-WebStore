@@ -1154,9 +1154,12 @@ async function refreshUniboxContactsMap(userId, reason) {
     map.set(String(c.username || "").toLowerCase(), c.id);
   }
   _uniboxContactsCache = { at: Date.now(), userId, map };
-  // Any full refresh makes negative entries stale (fresh data may resolve
-  // them) — the caller re-records a miss below if still unknown.
-  _unknownHandleCache.clear();
+  // Negcache: drop only handles that now resolve (fresh contact may fix
+  // them). Never blanket-clear: that forced one full refetch per unknown
+  // handle per pass and persisted an empty misses set.
+  for (const h of [..._unknownHandleCache.keys()]) {
+    if (map.has(h)) _unknownHandleCache.delete(h);
+  }
   // EGRESS-E2b: persist so the map (and negcache) survive worker restarts.
   // Best-effort: storage failure just means next boot refetches (old behavior).
   try {
@@ -1236,7 +1239,10 @@ async function syncUniboxThreads(data) {
   // thread never synced, zero trace). The summary at the end names the
   // culprit outright. Runs with zero activity stay silent except every 30th
   // run (~hourly heartbeat) so pure-idle stretches remain visible.
-  const _sum = { total: 0, synced: 0, notContact: 0, badShape: 0, group: 0, stale: 0, failed: 0, notContactSample: [] };
+  const _sum = { total: 0, synced: 0, notContact: 0, badShape: 0, group: 0, stale: 0, noId: 0, noTs: 0, emptyMsgs: 0, failed: 0, notContactSample: [] };
+  // Late-reconciliation evidence: newest outgoing synced row per contact.
+  // Consumed after the loop by reconcileLateDeliveries() — never blocks sync.
+  const _lateEvidence = new Map();
   for (const [targetUsername, info] of Object.entries(threads)) {
     _sum.total++;
     try {
@@ -1276,11 +1282,13 @@ async function syncUniboxThreads(data) {
 
       const seenIds = new Set();
       const fresh = [];
+      if (!info.messages.length) { _sum.emptyMsgs++; }
       for (const m of info.messages) {
         const ts = normalizeIgTimestampMs(m.timestampMs);
-        if (!ts) continue;
-        const id = String(m.messageId ?? "");
-        if (!id || seenIds.has(id)) continue;
+        if (!ts) { _sum.noTs++; continue; }
+        const id = String(m.messageId ?? m.message_id ?? "");
+        if (!id) { _sum.noId++; continue; }
+        if (seenIds.has(id)) continue;
         seenIds.add(id);
         if (Number(ts) <= watermark) continue;
         fresh.push({
@@ -1348,6 +1356,17 @@ async function syncUniboxThreads(data) {
       if (newWm > 0) await chrome.storage.local.set({ [wmKey]: newWm });
       _sum.synced++;
       debugLog(`[Unibox] synced @${targetUsername}: ${windowed.length} msg(s), wm=${newWm}`);
+      try {
+        const _own = windowed.filter(w => w && w.is_own && typeof w.text === "string" && w.text.trim());
+        if (_own.length) {
+          _own.sort((a, b) => a.ts_ms - b.ts_ms);
+          const _best = _own[_own.length - 1];
+          const _prev = _lateEvidence.get(contactId);
+          if (!_prev || Number(_best.ts_ms) > Number(_prev.ts_ms)) {
+            _lateEvidence.set(contactId, { handle, thread_key: String(info.thread_key), ts_ms: Number(_best.ts_ms), text: _best.text });
+          }
+        }
+      } catch (_) {}
     } catch (e) {
       // one bad thread must never abort the rest of the dump
       _sum.failed++;
@@ -1358,8 +1377,68 @@ async function syncUniboxThreads(data) {
   // hourly heartbeat so pure-idle stretches stay distinguishable from a
   // dead sync loop. _uniboxSyncRuns is module scope (alarms are sequential).
   _uniboxSyncRuns++;
-  if (_sum.synced || _sum.failed || _sum.notContact || _sum.badShape || _sum.group || _uniboxSyncRuns % 30 === 0) {
+  if (_sum.synced || _sum.failed || _sum.notContact || _sum.badShape || _sum.group || _sum.noId || _sum.noTs || _uniboxSyncRuns % 30 === 0) {
     dlog("unibox_sync_summary", { ..._sum, run: _uniboxSyncRuns });
+  }
+  // Late reconciliation: flip send_unconfirmed / timeout rows to completed
+  // once the inbox proof arrives. Runs only on passes that synced something,
+  // never throws (sync outcome is already recorded above).
+  if (_lateEvidence.size) {
+    await reconcileLateDeliveries(_lateEvidence).catch(() => {});
+  }
+}
+
+// Late-reconciliation (fail-closed self-heal for the verifier's blind spot).
+// Evidence: newest outgoing synced row per contact from THIS pass (Relay text,
+// IG timestamp). Candidates: failed/delivery_unknown* rows on THIS browser,
+// excluding unibox_reply (owned by pollUniboxReplies). Match requires all of:
+//   1. same contact_id (strongest key — never handle/thread strings),
+//   2. first-40-char normalized text equality (truncation-safe both sides),
+//   3. needle >= 15 chars (never auto-flip on "hi"/"lil"),
+//   4. synced ts within [claimed_at - 10min skew, now] (no ancient credit).
+// The flip reuses settleLateVerifiedDelivery(), which atomically re-checks
+// status=failed + like.delivery_unknown* — races (watchdog, reaper, double
+// pass) no-op instead of double-crediting. At most ONE row per contact per
+// pass (oldest first); the rest wait for the next pass. NEVER requeues,
+// NEVER touches watermarks, NEVER revives non-delivery_unknown failures.
+async function reconcileLateDeliveries(evidence) {
+  if (!evidence || !evidence.size) return;
+  try {
+    const rows = await supabaseReq(`dm_tasks?select=id,contact_id,task_type,message_text,claimed_at,created_at&browser_instance_id=eq.${state.browserId}&status=eq.failed&error_reason=like.delivery_unknown*&task_type=neq.unibox_reply&order=claimed_at.asc.nullslast,created_at.asc&limit=20`);
+    if (!rows || !rows.length) return;
+    const norm = x => String(x ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    const byContact = new Map();
+    for (const r of rows) {
+      if (!r || !r.contact_id) continue;
+      if (!byContact.has(r.contact_id)) byContact.set(r.contact_id, []);
+      byContact.get(r.contact_id).push(r);
+    }
+    for (const [contactId, ev] of evidence) {
+      const cands = byContact.get(contactId);
+      if (!cands || !cands.length) continue;
+      const needle = norm(ev.text).slice(0, 40);
+      if (!needle || needle.length < 15) continue;
+      const evTs = Number(ev.ts_ms || 0);
+      if (!evTs) continue;
+      let flipped = false;
+      for (const c of cands) {
+        if (flipped) break;
+        const cNeedle = norm(c.message_text).slice(0, 40);
+        if (!cNeedle) continue;
+        if (cNeedle !== needle && !norm(ev.text).includes(cNeedle) && !cNeedle.includes(needle)) continue;
+        const anchor = c.claimed_at || c.created_at;
+        const anchorMs = anchor ? new Date(anchor).getTime() : 0;
+        if (anchorMs && evTs < anchorMs - 10 * 60_000) continue;
+        if (anchorMs && evTs > Date.now() + 10 * 60_000) continue;
+        const ok = await settleLateVerifiedDelivery(c.id).catch(() => false);
+        if (ok) {
+          flipped = true;
+          dlog("late_unibox_reconciled", { taskId: c.id, taskType: c.task_type, target: ev.handle, thread_key: ev.thread_key }, "warn");
+        }
+      }
+    }
+  } catch (e) {
+    dlog("late_unibox_reconcile_failed", { error: String(e?.message || e).slice(0, 180) }, "warn");
   }
 }
 
@@ -1770,8 +1849,39 @@ async function refreshHoursAndHealNaps() {
 // Pacing Engine Helpers (centralized — server schedules, extension clamps)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Orphan reconciliation (B1): a MV3 restart mid-claim leaves a `processing`
+// row with no live worker. Fresh worker boots isProcessing=false so it can
+// never enter the 16-min lock-recovery branch; settle the orphan fail-closed
+// once per worker lifetime before any new claim. NEVER requeue (duplicate-DM
+// doctrine). Late verification flips delivery_unknown back via settleLateVerifiedDelivery.
+// ---------------------------------------------------------------------------
+let _reconciledOnce = false;
+async function reconcileInFlightTask() {
+  if (_reconciledOnce) return; _reconciledOnce = true;
+  try {
+    const { inFlightTaskId } = await chrome.storage.local.get('inFlightTaskId');
+    if (!inFlightTaskId) return;
+    const rows = await supabaseReq(`dm_tasks?select=id,status,browser_instance_id,task_type&id=eq.${inFlightTaskId}`);
+    const row = rows?.[0];
+    if (!row || row.status !== 'processing' || row.browser_instance_id !== state.browserId) {
+      await chrome.storage.local.remove('inFlightTaskId').catch(() => {});
+      return;
+    }
+    await supabaseReq(`dm_tasks?id=eq.${inFlightTaskId}&status=eq.processing`, 'PATCH', {
+      status: 'failed',
+      error_reason: 'delivery_unknown: the extension restarted during this send, so we can\'t tell whether the message went out. We won\'t retry it, so this lead can\'t receive the same DM twice — if it did land, this turns back into a completed send on its own.'
+    });
+    await chrome.storage.local.remove('inFlightTaskId').catch(() => {});
+    dlog('orphan_reconciled', { taskId: inFlightTaskId, taskType: row.task_type }, 'warn');
+  } catch (e) {
+    dlog('orphan_reconcile_failed', { error: String(e?.message || e).slice(0, 200) }, 'warn');
+  }
+}
+
 async function pollTasks() {
   if (!state.browserId) return;
+  await reconcileInFlightTask().catch(() => {});
   const pacingData = await chrome.storage.local.get('wakeUpAt');
   if (pacingData.wakeUpAt && Date.now() < pacingData.wakeUpAt) {
     return; // Still sleeping until next scheduled task
@@ -3805,23 +3915,28 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       timeoutErr.errorType = "content_script_timeout";
       settle(timeoutErr);
     } else {
-      // No settler registered: the task already unwound some other way, so there is
-      // nobody to reject. Fall back to the old force-release.
-      state.isProcessing = false;
-      await chrome.storage.local.remove('inFlightTaskId').catch(() => {});
+      // Ownership guard (B2): only release the lock/close the tab when the
+      // timed-out task still owns them. Otherwise the alarm belongs to an
+      // already-unwound task and the lock/tab belong to a NEWER task.
+      const inflight = await chrome.storage.local.get('inFlightTaskId').catch(() => ({}));
+      if (inflight && inflight.inFlightTaskId === taskId) {
+        state.isProcessing = false;
+        await chrome.storage.local.remove('inFlightTaskId').catch(() => {});
+      }
     }
 
-    // F-BUSY-01/02: the content script is still mid-task with isBusy = true, and an
-    // in-memory flag in another world cannot be cleared by extending a lease — which
-    // is why the next task met a busy tab and requeued, producing the thread_busy
-    // churn. ColdDMs' answer is to DESTROY the content script (its background.js:6214
-    // closes the tab on every error but user_is_unreachable), so close here too rather
-    // than merely reload: a task wedged for 10 minutes may be wedged at the page level,
-    // not just in the script. Safe because the row is already delivery_unknown, so no
-    // send is ever retried because of this. pollTasks' own delivery_unknown branch
-    // returns before the teardown ladder, so this is the only teardown for this path.
-    await closeMainTab(`content script timeout on task ${taskId}`);
-    dlog("cs_reset_after_timeout", { taskId }, "warn");
+    // Same ownership rule for the tab reset: never close a newer task's tab
+    // because an old alarm fired late.
+    try {
+      const inflight2 = await chrome.storage.local.get('inFlightTaskId').catch(() => ({}));
+      const stillOurs = !inflight2 || !inflight2.inFlightTaskId || inflight2.inFlightTaskId === taskId;
+      if (stillOurs) {
+        await closeMainTab(`content script timeout on task ${taskId}`);
+        dlog("cs_reset_after_timeout", { taskId }, "warn");
+      } else {
+        dlog("cs_reset_skipped_new_owner", { taskId, owner: inflight2.inFlightTaskId }, "warn");
+      }
+    } catch (_) {}
   } catch (e) {
     debugLog(`[Alarm Watchdog] Error processing alarm for task ${taskId}: ${e.message}`);
   }
