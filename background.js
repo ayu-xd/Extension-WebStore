@@ -127,12 +127,50 @@ async function computeTodayStats() {
     const bounds = tzDayBoundsUtc(tz);
     const start = bounds.start.toISOString();
     const end = bounds.end.toISOString();
-    const sent = await supabaseReq(`dm_tasks?select=id&browser_instance_id=eq.${state.browserId}&status=eq.completed&completed_at=gte.${start}&completed_at=lt.${end}`);
-    const pend = await supabaseReq(`dm_tasks?select=id&browser_instance_id=eq.${state.browserId}&status=eq.pending&or=(scheduled_at.is.null,scheduled_at.lt.${end})`);
-    return { sentToday: (sent || []).length, pendingToday: (pend || []).length };
+    // S1: HEAD counts, not ID-list downloads. Same predicates as before —
+    // note pending intentionally has NO lower day bound (includes overdue).
+    const cacheKey = `${state.browserId}|${start}|${end}`;
+    const now = Date.now();
+    if (_todayStatsCache.key === cacheKey && now - _todayStatsCache.at < 30000 && _todayStatsCache.value) {
+      return _todayStatsCache.value;
+    }
+    const [sent, pend] = await Promise.all([
+      supabaseCount(`dm_tasks?browser_instance_id=eq.${state.browserId}&status=eq.completed&completed_at=gte.${start}&completed_at=lt.${end}`),
+      supabaseCount(`dm_tasks?browser_instance_id=eq.${state.browserId}&status=eq.pending&or=(scheduled_at.is.null,scheduled_at.lt.${end})`)
+    ]);
+    const value = { sentToday: sent, pendingToday: pend };
+    _todayStatsCache = { key: cacheKey, at: now, value };
+    return value;
   } catch (_e) {
+    // Stale beats zero: a failed refresh must not blank the cards.
+    if (_todayStatsCache.value) return _todayStatsCache.value;
     return { sentToday: 0, pendingToday: 0 };
   }
+}
+
+// Last-good today-stats (memory only; day-bounded by cache key above).
+let _todayStatsCache = { key: null, at: 0, value: null };
+
+// HEAD count helper: returns the exact count, transfers (almost) no body.
+// Throws on missing/unparseable Content-Range so callers fall back loudly.
+async function supabaseCount(path, _retried = false) {
+  const headers = {
+    "apikey": SUPABASE_ANON_KEY,
+    "Authorization": `Bearer ${state.accessToken ? state.accessToken : SUPABASE_ANON_KEY}`,
+    "Prefer": "count=exact"
+  };
+  const res = await fetchWithRetry(`${SUPABASE_URL}/rest/v1/${path}`, { method: "HEAD", headers });
+  if (res.status === 401 && !_retried && state.refreshToken) {
+    const refreshed = await refreshAccessTokenSingleFlight();
+    if (refreshed) return supabaseCount(path, true);
+  }
+  if (!res.ok) {
+    throw new Error(`Supabase count error: ${res.status} ${res.statusText}`);
+  }
+  const range = res.headers.get("content-range") || "";
+  const m = range.match(/\/(\d+)\s*$/);
+  if (!m) throw new Error(`Supabase count error: missing content-range (${range.slice(0, 40)})`);
+  return Number(m[1]);
 }
 
 async function syncStatsFromDatabase() {
@@ -177,8 +215,10 @@ const EGRESS = {
   // E1: columns the 15s task poll is allowed to read. Covers every task.*
   // field consumed downstream (executeTask, claim log, scrape params).
   pollCols: "id,contact_id,task_type,message_text,scheduled_at,retry_count,thread_id,campaign_id,user_id",
-  // E1: columns the 1-min unibox poll reads (rt.* downstream).
-  uniboxCols: "id,contact_id,thread_id,message_text",
+  // E1: columns the 1-min unibox poll reads (rt.* downstream). retry_count
+  // is load-bearing: the error path below bounds reply retries from it — a
+  // narrowed row without it defaults to 0 and retries forever.
+  uniboxCols: "id,contact_id,thread_id,message_text,retry_count",
   // E2: contacts handle->id map TTL (was 60s) + unknown-handle refresh.
   contactsTtlMs: 30 * 60_000,
   // E3: account working-hours TTL (was 5 min). Fail-open unchanged.
@@ -203,8 +243,14 @@ function narrowGuard(row, cols, event) {
 
 // EGRESS-LOG: per-run collector batch counters, flushed as one collector_batch
 // line (reset after flush). Module scope: processCollectedMessages runs are
-// sequential on the alarm, so no interleaving.
-const _egressBatch = { seen: 0, replied: 0, canceled: 0 };
+// sequential on the alarm, so no interleaving. S7: unresolved counts receipts
+// that matched no contact (skipped writes); replied counts resolved IDs.
+const _egressBatch = { seen: 0, replied: 0, canceled: 0, unresolved: 0 };
+
+// S7: confirmed-stranger receipts skip all writes until this TTL expires
+// (memory-only: worst case is one extra quiet pass after a worker restart).
+const _collectorMiss = new Map(); // username -> last-confirmed-miss-at
+const COLLECTOR_MISS_TTL_MS = 30 * 60_000;
 
 // ---------------------------------------------------------------------------
 // Supabase REST Client
@@ -237,7 +283,12 @@ async function supabaseReq(path, method = "GET", body = null, _retried = false, 
   // unibox claim/completion/quarantine (821/878/887) and cancel (1225) read
   // the returned rows, and those pass { representation: true }. POST/GET keep
   // return=representation (target_lists + sync_unibox_thread consume rows).
-  const _minimal = method === "PATCH" && !(opts && opts.representation);
+  // S2: opts.select projects representation to listed columns; opts.minimal
+  // forces minimal on any method (callers that ignore rows).
+  const _minimal = (method === "PATCH" && !(opts && opts.representation)) || !!(opts && opts.minimal);
+  const _select = opts && opts.select
+    ? (path.includes("?") ? `&select=${opts.select}` : `?select=${opts.select}`)
+    : "";
   const headers = {
     "apikey": SUPABASE_ANON_KEY,
     "Authorization": `Bearer ${state.accessToken ? state.accessToken : SUPABASE_ANON_KEY}`,
@@ -247,7 +298,7 @@ async function supabaseReq(path, method = "GET", body = null, _retried = false, 
   const options = { method, headers };
   if (body) options.body = JSON.stringify(body);
 
-  const res = await fetchWithRetry(`${SUPABASE_URL}/rest/v1/${path}`, options);
+  const res = await fetchWithRetry(`${SUPABASE_URL}/rest/v1/${path}${_select}`, options);
   if (res.status === 401 && !_retried && state.refreshToken) {
     debugLog("Token expired, refreshing...");
     const refreshed = await refreshAccessTokenSingleFlight();
@@ -268,14 +319,16 @@ async function supabaseUpsert(path, body, onConflict, _retried = false, opts = n
   // EGRESS-E0: upserts default to return=minimal (callers: caoUpsert ignores
   // rows). The browser_instances pairing upsert passes { representation: true }
   // because it reads rows[0].id/label.
+  // S2: opts.select projects the representation (appended after on_conflict).
   const _minimal = !(opts && opts.representation);
+  const _select = opts && opts.select ? `&select=${opts.select}` : "";
   const headers = {
     "apikey": SUPABASE_ANON_KEY,
     "Authorization": `Bearer ${state.accessToken ? state.accessToken : SUPABASE_ANON_KEY}`,
     "Content-Type": "application/json",
     "Prefer": _minimal ? "resolution=merge-duplicates,return=minimal" : "resolution=merge-duplicates,return=representation"
   };
-  const res = await fetchWithRetry(`${SUPABASE_URL}/rest/v1/${path}?on_conflict=${onConflict}`, {
+  const res = await fetchWithRetry(`${SUPABASE_URL}/rest/v1/${path}?on_conflict=${onConflict}${_select}`, {
     method: "POST", headers, body: JSON.stringify(body)
   });
   if (res.status === 401 && !_retried && state.refreshToken) {
@@ -351,7 +404,7 @@ async function settleLateVerifiedDelivery(taskId) {
     "PATCH",
     { status: "completed", completed_at: completedAt, error_reason: null },
     false,
-    { representation: true } // EGRESS-E0 opt-out: rows?.[0] below reads contact_id/type.
+    { representation: true, select: "contact_id,task_type,campaign_id" } // EGRESS-E0 opt-out: rows?.[0] below reads contact_id/type.
   );
   const task = rows?.[0];
   if (!task) return false;
@@ -509,11 +562,11 @@ async function init() {
     const refreshed = await refreshAccessTokenSingleFlight();
     if (refreshed) {
       startEngine();
-      await syncStatsFromDatabase();
+      // S1: no lifetime history sync on ordinary boot — popup shows
+      // today-counts (HEAD), lifetime state.stats restores from storage.
     }
   } else if (state.accessToken && state.browserId) {
     startEngine();
-    await syncStatsFromDatabase();
   } else if (state.refreshToken || state.accessToken) {
     // We have a session but no paired row (e.g. the row was deleted from the
     // dashboard, or this is the first boot after a session sync). Re-pair via
@@ -694,7 +747,7 @@ async function _autoPairBrowserInner() {
       },
       "user_id,instance_key",
       false,
-      { representation: true } // EGRESS-E0 opt-out: rows[0].id/label below.
+      { representation: true, select: "id,label" } // EGRESS-E0 opt-out: rows[0].id/label below.
     );
 
     if (rows && rows.length > 0) {
@@ -921,7 +974,7 @@ async function pollUniboxReplies() {
       const claimed = await supabaseReq(`dm_tasks?id=eq.${rt.id}&status=eq.pending`, "PATCH", {
         status: "processing",
         claimed_at: nowIso
-      }, false, { representation: true }); // EGRESS-E0 opt-out: claimed?.length is the lock proof.
+      }, false, { representation: true, select: "id" }); // EGRESS-E0 opt-out: claimed?.length is the lock proof.
       if (!claimed?.length) {
         dlog("unibox_claim_lost", { taskId: rt.id }, "warn");
         return;
@@ -981,7 +1034,7 @@ async function pollUniboxReplies() {
           status: "completed",
           completed_at: completedAt,
           error_reason: null
-        }, false, { representation: true }); // EGRESS-E0 opt-out: completed?.length proves terminality.
+        }, false, { representation: true, select: "id" }); // EGRESS-E0 opt-out: completed?.length proves terminality.
         if (!completed?.length) throw new Error("completion update affected no processing row");
       } catch (e) {
         const reason = `delivery_confirmed_bookkeeping_failed: ${String(e?.message || e).slice(0, 180)}`;
@@ -990,7 +1043,7 @@ async function pollUniboxReplies() {
             status: "failed",
             completed_at: completedAt,
             error_reason: reason
-          }, false, { representation: true }); // EGRESS-E0 opt-out: quarantined?.length proves terminality.
+          }, false, { representation: true, select: "id" }); // EGRESS-E0 opt-out: quarantined?.length proves terminality.
           if (!quarantined?.length) throw new Error("terminal quarantine affected no processing row");
           dlog("unibox_delivery_quarantined", { taskId: rt.id, reason }, "error");
           debugLog(`[Unibox] delivery was verified but completion bookkeeping failed; task quarantined: ${reason}`);
@@ -1162,17 +1215,25 @@ async function refreshUniboxContactsMap(userId, reason) {
   }
   // EGRESS-E2b: persist so the map (and negcache) survive worker restarts.
   // Best-effort: storage failure just means next boot refetches (old behavior).
+  // Persisted AFTER the map/negcache were updated above — never before.
+  await persistUniboxContactsCache();
+  dlog("contacts_map_refresh", { reason, rows: map.size });
+  return map;
+}
+
+// S3: persist map + negcache AFTER applying results. Split out so the sync
+// loop can re-persist after recording misses (the old inline persist ran
+// before the caller recorded the current miss, losing it on restart).
+async function persistUniboxContactsCache() {
   try {
     await chrome.storage.local.set({ uniboxContactsCache: {
-      at: _uniboxContactsCache.at, userId,
-      entries: [...map].slice(0, 5000),
+      at: _uniboxContactsCache.at, userId: _uniboxContactsCache.userId,
+      entries: [..._uniboxContactsCache.map].slice(0, 5000),
       misses: [..._unknownHandleCache].slice(0, 500),
     } });
   } catch (_e) {
     debugLog(`[Unibox] contacts cache persist failed (non-fatal): ${_e?.message || _e}`);
   }
-  dlog("contacts_map_refresh", { reason, rows: map.size });
-  return map;
 }
 
 // EGRESS-E2b: restore persisted map + negcache. Validates owner + TTL —
@@ -1227,6 +1288,30 @@ function noteUnknownHandle(handle, resolved) {
   }
 }
 
+// S3: bounded targeted lookup for unknown handles — one small query instead
+// of a full 775-row map per stranger. Case-insensitive exact match (ilike,
+// no wildcards) with LIKE-escaping, so mixed-case stored rows resolve exactly
+// as the lowercasing full-map build finds them. Last-wins on duplicate
+// normalized usernames — same contract as the full build. Throws on transport
+// failure: the caller must NOT record absence from a failed lookup.
+async function resolveUnknownHandles(userId, handles) {
+  const uniq = [...new Set((handles || []).map(h => String(h || "").toLowerCase()).filter(Boolean))].slice(0, 50);
+  if (!uniq.length) return new Map();
+  const esc = s => String(s).replace(/[\\%_]/g, m => `\\${m}`);
+  const orTerm = uniq.map(h => `username.ilike.${esc(h)}`).join(",");
+  const rows = await supabaseReq(`contacts?select=id,username&user_id=eq.${userId}&or=(${orTerm})`);
+  const map = new Map();
+  for (const c of rows || []) {
+    map.set(String(c.username || "").toLowerCase(), c.id);
+  }
+  return map;
+}
+
+// S3: transport-failure suppression for the targeted batch (distinct from the
+// 30-min absence TTL): a failed lookup retries next pass, but backs off 60s
+// so an outage doesn't cost a query per pass per thread.
+let _targetedFailAt = 0;
+
 // Module-scope run counter for the hourly sync heartbeat (declared before
 // use; alarms fire sequentially so no interleave).
 let _uniboxSyncRuns = 0;
@@ -1243,28 +1328,69 @@ async function syncUniboxThreads(data) {
   // Late-reconciliation evidence: newest outgoing synced row per contact.
   // Consumed after the loop by reconcileLateDeliveries() — never blocks sync.
   const _lateEvidence = new Map();
+  // S3: always read through this accessor — refreshUniboxContactsMap replaces
+  // the Map object, so a captured reference goes stale mid-pass.
+  const liveMap = () => _uniboxContactsCache.map;
+  // S3 pre-pass: resolve unknown handles with ONE bounded batch instead of one
+  // full map per stranger. Brand-new handles keep today's immediate full-refresh
+  // guarantee (once each); expired misses are rechecked by the batch and
+  // re-stamped without another full download. Transport failure records
+  // nothing (failure is not absence) and suppresses retry for 60s.
+  {
+    const _preMiss = new Set(_unknownHandleCache.keys());
+    const _need = [];
+    for (const [targetUsername] of Object.entries(threads)) {
+      const h = String(targetUsername || "").toLowerCase();
+      if (h && !liveMap().get(h) && unknownHandleNeedsRefresh(h)) _need.push(h);
+    }
+    const _uniqNeed = [...new Set(_need)];
+    if (_uniqNeed.length && Date.now() - _targetedFailAt > 60000) {
+      let _contactsDirty = false;
+      try {
+        const found = await resolveUnknownHandles(ctx.userId, _uniqNeed);
+        const nowMs = Date.now();
+        for (const [h, id] of found) { liveMap().set(h, id); noteUnknownHandle(h, true); }
+        for (const h of _uniqNeed) {
+          if (found.has(h)) { _contactsDirty = true; continue; }
+          // Confirmed miss as of this successful lookup: restart the quiet
+          // interval (keeping the expired stamp would refresh every pass).
+          const isNew = !_preMiss.has(h);
+          _unknownHandleCache.delete(h);
+          _unknownHandleCache.set(h, nowMs);
+          if (isNew) dlog("unknown_handle_skipped", { handle: h });
+          _contactsDirty = true;
+        }
+        dlog("contacts_targeted_resolve", { asked: _uniqNeed.length, found: found.size });
+        // Blind-spot escape hatch: handles never seen before that the batch
+        // could not resolve (case/RLS surprise) get today's one full refresh,
+        // then join the normal miss cycle — never a repeat storm.
+        const _brandNew = _uniqNeed.filter(h => !found.has(h) && !_preMiss.has(h));
+        if (_brandNew.length) {
+          try {
+            const fresh = await refreshUniboxContactsMap(ctx.userId, "unknown-handle-new");
+            for (const h of _brandNew) {
+              const id = fresh.get(h) || null;
+              if (id) noteUnknownHandle(h, true);
+            }
+          } catch (_) { /* miss records above already stand */ }
+        }
+      } catch (_) {
+        _targetedFailAt = Date.now();
+      }
+      if (_contactsDirty) await persistUniboxContactsCache().catch(() => {});
+    }
+  }
   for (const [targetUsername, info] of Object.entries(threads)) {
     _sum.total++;
     try {
       const handle = String(targetUsername || "").toLowerCase();
-      let contactId = ctx.contacts.get(handle) || null;
-      // EGRESS-E2 safety: with a 30-min map TTL, a freshly added contact's
-      // thread would be skipped for up to 30 min. Refresh once on unknown
-      // handle before giving up — the refresh itself is logged. Repeat
-      // misses inside the TTL window skip via negative cache (no refetch).
+      let contactId = liveMap().get(handle) || null;
+      // Resolution ran in the pre-pass above (batch + one fallback refresh).
+      // Anything still unknown was recorded this pass — skip quietly.
       if (!contactId) {
-        if (unknownHandleNeedsRefresh(handle)) {
-          try {
-            const fresh = await refreshUniboxContactsMap(ctx.userId, "unknown-handle");
-            contactId = fresh.get(handle) || null;
-          } catch (_) { /* fall through to skip below */ }
-        }
-        noteUnknownHandle(handle, !!contactId);
-        if (!contactId) {
-          _sum.notContact++;
-          if (_sum.notContactSample.length < 3) _sum.notContactSample.push(handle || "(empty)");
-          continue;
-        }
+        _sum.notContact++;
+        if (_sum.notContactSample.length < 3) _sum.notContactSample.push(handle || "(empty)");
+        continue;
       }
       if (!info?.thread_key || !Array.isArray(info.messages)) { _sum.badShape++; continue; }
 
@@ -1464,30 +1590,74 @@ async function processCollectedMessages(readReceipts) {
       }
     }
 
+    // S7: shared identity map for this pass (seen block fills, replied
+    // block consumes — replied ⊆ seen, so one lookup serves both).
+    const _idByUser = new Map();
     if (seenUsernames.size > 0) {
       const userList = Array.from(seenUsernames);
       debugLog(`[Collector] Found ${userList.length} contact(s) — ${seenCount} seen, ${replyCount} replied.`);
 
+      // S7: resolve the union ONCE per pass and share it between the seen +
+      // replied loops below (replied ⊆ seen). Unmatched receipts skip every
+      // write and sit in a short memory TTL; lookup transport failures record
+      // nothing and retry next pass. Cancellation predicates unchanged.
+      let _unresolved = 0;
       for (let i = 0; i < userList.length; i += 50) {
         const chunk = userList.slice(i, i + 50);
-        const inQuery = chunk.map(u => `"${u}"`).join(",");
-        await supabaseReq(
-          `contacts?media_seen=eq.false&username=in.(${inQuery})`,
-          "PATCH",
-          { media_seen: true, media_seen_at: new Date().toISOString() }
-        );
-        // Dual-write per-account seen state. The seen/reply came from THIS
-        // browser's logged-in IG account, so it belongs to (contact, thisBrowser).
-        // EGRESS-E4: one batched upsert per chunk instead of N single-row calls.
+        // Recently-confirmed strangers cost nothing until the TTL expires
+        // (a later contact-add re-resolves on expiry).
+        const fresh = chunk.filter(u => {
+          const miss = _collectorMiss.get(u);
+          return !(miss && Date.now() - miss < COLLECTOR_MISS_TTL_MS);
+        });
+        if (!fresh.length) { _unresolved += chunk.length; continue; }
+        const inQuery = fresh.map(u => `"${u}"`).join(",");
+        let rows = null;
         try {
-          const seenContacts = await supabaseReq(`contacts?select=id&username=in.(${inQuery})`);
-          const _now = new Date().toISOString();
-          await caoUpsertMany((seenContacts || []).map(c => ({ contactId: c.id, fields: { media_seen: true, media_seen_at: _now } })));
+          rows = await supabaseReq(`contacts?select=id,username&username=in.(${inQuery})`);
         } catch (e) {
-          debugLog(`[CAO] seen dual-write failed (non-fatal): ${e.message}`);
+          debugLog(`[Collector] identity lookup failed (non-fatal, retry next pass): ${e.message}`);
+          continue;
+        }
+        const nowMs = Date.now();
+        const matched = new Set();
+        for (const c of rows || []) {
+          const key = String(c.username || "").toLowerCase();
+          if (!key) continue;
+          matched.add(key);
+          if (c.id && !_idByUser.has(key)) _idByUser.set(key, c.id);
+        }
+        const hit = [];
+        for (const u of fresh) {
+          if (matched.has(u)) {
+            hit.push(u);
+            _collectorMiss.delete(u);
+          } else {
+            _collectorMiss.set(u, nowMs);
+            _unresolved++;
+          }
+        }
+        // Seen writes ONLY for matched usernames (same predicates as before).
+        if (hit.length) {
+          const hitQuery = hit.map(u => `"${u}"`).join(",");
+          await supabaseReq(
+            `contacts?media_seen=eq.false&username=in.(${hitQuery})`,
+            "PATCH",
+            { media_seen: true, media_seen_at: new Date().toISOString() }
+          );
+          // Dual-write per-account seen state. The seen/reply came from THIS
+          // browser's logged-in IG account, so it belongs to (contact, thisBrowser).
+          // EGRESS-E4: one batched upsert per chunk instead of N single-row calls.
+          try {
+            const _now = new Date().toISOString();
+            await caoUpsertMany(hit.map(u => ({ contactId: _idByUser.get(u), fields: { media_seen: true, media_seen_at: _now } })).filter(e => e.contactId));
+          } catch (e) {
+            debugLog(`[CAO] seen dual-write failed (non-fatal): ${e.message}`);
+          }
         }
       }
-      _egressBatch.seen += userList.length;
+      _egressBatch.seen += _idByUser.size;
+      _egressBatch.unresolved = (_egressBatch.unresolved || 0) + _unresolved;
     }
 
     // Leads who replied: proactively cancel their remaining follow-ups so we never
@@ -1496,12 +1666,12 @@ async function processCollectedMessages(readReceipts) {
       const repliedList = Array.from(repliedUsernames);
       for (let i = 0; i < repliedList.length; i += 50) {
         const chunk = repliedList.slice(i, i + 50);
-        const inQuery = chunk.map(u => `"${u}"`).join(",");
-        const contacts = await supabaseReq(`contacts?select=id&username=in.(${inQuery})`);
-        // EGRESS-E4: one replied-PATCH per chunk (was N per-contact PATCHes),
+        // S7: shared identity from the seen pass above — no second lookup.
+        // Unmatched replied receipts were already counted unresolved there.
+        const _ids = chunk.map(u => _idByUser.get(u)).filter(Boolean);
+        if (!_ids.length) continue;
         // one batched dual-write, one batched cancel. Same semantics, 3 calls
         // per chunk regardless of chunk size.
-        const _ids = (contacts || []).map(c => c.id).filter(Boolean);
         if (_ids.length) {
           const _now = new Date().toISOString();
           try {
@@ -1516,9 +1686,11 @@ async function processCollectedMessages(readReceipts) {
     }
     // EGRESS-LOG: per-run batch summary — in a bundle this line replaces N
     // per-contact write logs. Zero-activity runs stay silent (no spam).
-    if (_egressBatch.seen || _egressBatch.replied || _egressBatch.canceled) {
+    // S7: seen/replied count RESOLVED identities now (inputs that match
+    // nobody land in unresolved instead of inflating seen).
+    if (_egressBatch.seen || _egressBatch.replied || _egressBatch.canceled || _egressBatch.unresolved) {
       dlog("collector_batch", { ..._egressBatch });
-      _egressBatch.seen = 0; _egressBatch.replied = 0; _egressBatch.canceled = 0;
+      _egressBatch.seen = 0; _egressBatch.replied = 0; _egressBatch.canceled = 0; _egressBatch.unresolved = 0;
     }
   } catch (err) {
     debugLog(`[Collector] Error processing collected messages: ${err.message}`);
@@ -1538,7 +1710,7 @@ async function cancelPendingFollowupsMany(contactIds, reason) {
       "PATCH",
       { status: "skipped", error_reason: reason },
       false,
-      { representation: true }
+      { representation: true, select: "id" }
     );
     const count = Array.isArray(cancelled) ? cancelled.length : 0;
     if (count > 0) {
@@ -1564,7 +1736,7 @@ async function cancelPendingFollowups(contactId, reason) {
       "PATCH",
       { status: "skipped", error_reason: reason },
       false,
-      { representation: true } // EGRESS-E0 opt-out: length is the cancel count.
+      { representation: true, select: "id" } // EGRESS-E0 opt-out: length is the cancel count.
     );
     const count = Array.isArray(cancelled) ? cancelled.length : 0;
     if (count > 0) {
@@ -1596,21 +1768,18 @@ async function cancelPendingFollowups(contactId, reason) {
 // blast radius inside the owner's own rows. 'processing' is left alone so we never
 // yank a task out from under an in-flight send.
 async function retirePendingTasksForContact(contactId, reason) {
-  if (!contactId) return 0;
+  if (!contactId) return;
+  // S2: minimal write — the affected-row count is unknowable from a minimal
+  // response, and the caller ignores the return value, so report nothing
+  // rather than a fiction. Fire-and-forget by contract.
   try {
-    const retired = await supabaseReq(
+    await supabaseReq(
       `dm_tasks?contact_id=eq.${contactId}&status=eq.pending`,
       "PATCH",
       { status: "skipped", error_reason: reason }
     );
-    const count = Array.isArray(retired) ? retired.length : 0;
-    if (count > 0) {
-      debugLog(`[Collector] Retired ${count} queued task(s) for parked contact ${contactId}.`);
-    }
-    return count;
   } catch (err) {
     debugLog(`[Collector] Error retiring queued tasks for contact ${contactId}: ${err.message}`);
-    return 0;
   }
 }
 
@@ -2002,7 +2171,7 @@ async function pollTasks() {
     // succeed — risking a double-DM. With &status=eq.pending, the loser gets
     // zero rows and walks away. Same pattern as the unibox claim below.
     // Representation opt-out required: claimed?.length IS the lock proof.
-    const claimedTask = await supabaseReq(`dm_tasks?id=eq.${task.id}&status=eq.pending`, "PATCH", { status: "processing", claimed_at: new Date().toISOString() }, false, { representation: true });
+    const claimedTask = await supabaseReq(`dm_tasks?id=eq.${task.id}&status=eq.pending`, "PATCH", { status: "processing", claimed_at: new Date().toISOString() }, false, { representation: true, select: "id" });
     if (!claimedTask?.length) {
       dlog("claim_lost_race", { taskId: task.id, taskType: task.task_type }, "warn");
       return;
@@ -2220,7 +2389,11 @@ async function pollTasks() {
 
         const currentRetries = Number(task.retry_count || 0);
 
-        // P7: per-class retry ceiling. Default stays 3. The dialog attempt
+        // P7: per-class retry ceiling. Default is 1 (initial + one retry):
+        // the 2nd/3rd generic retries almost never rescued anything — by then
+        // the tab is genuinely sick — and each re-fire is a fresh page load +
+        // search burst for zero payoff. Failed leads come back tomorrow via
+        // normal regeneration, which is the real retry. The dialog attempt
         // itself is byte-identical to ColdDMs' _openUser (2 typed tries, 10
         // result polls each, then user_click_error) — the DELTA from ColdDMs
         // was the fresh-tab retry for the search_missing_* classes, and the
@@ -2237,7 +2410,7 @@ async function pollTasks() {
         //     then make them fuck off" — one clean attempt, no tab drama.
         // A dead handle (user_not_found) is permanent and never retries.
         const RETRY_CEILING = { search_missing_alive: 1, search_missing_unproven: 0 };
-        const maxRetries = RETRY_CEILING[retryClass] ?? 3;
+        const maxRetries = RETRY_CEILING[retryClass] ?? 1;
 
         // E-04/P5 note: the old inbox-freshen block that lived here only covered
         // five dialog classes and only navigated the tab. It is superseded by the
@@ -3007,7 +3180,7 @@ async function executeTask(task) {
                   const params = JSON.parse(task.message_text);
                   const typeStr = task.task_type === 'scrape_followers' ? "followers" : "following";
 
-                  const listRes = await supabaseReq(`target_lists`, "POST", {
+                  const listRes = await supabaseReq(`target_lists?select=id`, "POST", {
                     user_id: task.user_id,
                     name: `Scraped: ${params.target} (${typeStr})`,
                     type: "raw",
@@ -3037,7 +3210,7 @@ async function executeTask(task) {
                         target_list_id: listId,
                         contact_id: cId
                       }));
-                      await supabaseReq(`target_list_items`, "POST", links);
+                      await supabaseReq(`target_list_items`, "POST", links, false, { minimal: true });
                     }
                   }
                 }
@@ -3457,7 +3630,7 @@ async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) 
     // comment above warns about — pollTasks parks the contact whenever
     // err.unreachableType is set, so a dead content script in OUR tab was parking
     // a perfectly live lead as unreachable. Same class name, correct field: it now
-    // routes as a transient error with the normal 3 retries and never touches the
+    // routes as a transient error with the normal retry and never touches the
     // contact. (Left as unreachableType this would also have retired the lead's
     // queued tasks once CHURN-04 landed, turning a browser hiccup into lost leads.)
     errObj.errorType = "instagram_reload_error";
@@ -3564,9 +3737,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "GET_STATS") {
     (async () => {
       try {
-        const stats = await syncStatsFromDatabase();
+        // S1: popup renders sentToday/pendingToday only — no lifetime history.
         const today = await computeTodayStats();
-        sendResponse({ ok: true, stats: { ...stats, ...today } });
+        sendResponse({ ok: true, stats: { ...today } });
       } catch (err) {
         sendResponse({ ok: false, error: err.message });
       }
@@ -3749,10 +3922,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     //
     // TAKEOVER-BACKOFF (module scope map below): when the RPC refuses with
     // takeover_blocked_live (handle alive on another live browser), we record
-    // a 6h per-handle backoff and answer subsequent attempts locally WITHOUT
+    // a 25-min per-handle backoff and answer subsequent attempts locally WITHOUT
     // network or log spam. Content's retry loop (3 min per tab init) then burns
-    // ~36 local no-ops instead of hammering a call the server will refuse.
-    // The extension never passes p_force — only a future dashboard confirm may.
+    // ~8 local no-ops instead of hammering a call the server will refuse.
+    // 25 min = 20-min server gate + 5 min margin, so local suppression never
+    // outlasts the gate it mirrors. The extension never passes p_force — only
+    // a future dashboard confirm may.
     if (taskType === "registerAccounts") {
       (async () => {
         try {
@@ -3783,7 +3958,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 }
 
                 // Takeover backoff: a live-elsewhere refusal parks this handle
-                // for 6h (no network, no spam). Expired entries are lazy-swept.
+                // for 25 min (no network, no spam). Expired entries are lazy-swept.
                 if ((_takeoverBackoff[igUsername] || 0) > Date.now()) {
                   throw new Error(`takeover_blocked_live: backoff active for @${igUsername} (another live browser holds it)`);
                 }
@@ -3807,8 +3982,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 } catch (_rpcErr) {
                   const _msg = String(_rpcErr?.message || _rpcErr);
                   if (/takeover_blocked_live/.test(_msg)) {
-                    _takeoverBackoff[igUsername] = Date.now() + 6 * 3600_000;
-                    debugLog(`[IG Detect] Takeover refused — @${igUsername} is live on another browser; backing off 6h (no ping-pong).`);
+                    _takeoverBackoff[igUsername] = Date.now() + 25 * 60_000;
+                    debugLog(`[IG Detect] Takeover refused — @${igUsername} is live on another browser; backing off 25m (no ping-pong).`);
                     throw _rpcErr;
                   }
                   // GHOST-ROW recovery: our cached browserId points at a row
