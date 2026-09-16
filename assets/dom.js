@@ -684,12 +684,66 @@ class ADBlockDOM {
       await new Promise((e) => setTimeout(e, 150));
     }
   }
+  // THROTTLE-PROOF TYPING (2026-09-14 client Mac bundle): Chrome clamps
+  // background-tab timers to ~1 tick/sec — an OS-independent Chrome rule, not
+  // a macOS quirk. _enterMessage types one char per tick with 50-150ms jitter,
+  // so a ~240-char first_dm needs ~240 ticks: seconds on a watched tab, but
+  // 4+ minutes in a backgrounded one — past the 120s bridge ceiling (which is
+  // why that day every long first_dm failed 2x while every short followup on
+  // the SAME tab passed). Segmentation groups the text into <=6-word phrases
+  // (+ standalone newlines), cutting timer ticks ~18x with a byte-identical
+  // editor result, which is what the loose-compare verify and Instagram both
+  // see. GATED on document.hidden per iteration: a visible tab keeps the
+  // exact per-char human cadence — nothing about what a watching user (or
+  // Instagram) could observe on a foreground tab changes. Mid-send flips are
+  // safe: every insert is independent and the full-text inputHasText()
+  // rescue governs correctness either way.
+  _segmentThrottledText(text) {
+    const words = [];
+    for (const part of String(text).split(/\r?\n|\r/)) {
+      const toks = part.match(/[^ \t]+[ \t]*|[ \t]+/g);
+      if (toks) words.push(...toks);
+      words.push("\n");
+    }
+    words.pop();
+    const phrases = [];
+    let buf = [];
+    for (const w of words) {
+      if ("\n" === w) {
+        if (buf.length) phrases.push(buf.join("")), buf = [];
+        phrases.push("\n");
+        continue;
+      }
+      buf.push(w);
+      if (buf.length >= 6) phrases.push(buf.join("")), buf = [];
+    }
+    if (buf.length) phrases.push(buf.join(""));
+    return phrases.length ? phrases : [String(text)];
+  }
   async _enterMessage({
     text: e
   }) {
-    const t = await this._importNamespace("Lexical"),
-      n = document.querySelector('div[contenteditable="true"]')?.__lexicalEditor;
-    if (!n) throw new Error("Stuck");
+    // COMPOSER-WEDGE: typed, specific failure when the composer never mounts.
+    // The old generic "Stuck" read as a transient hiccup and gave callers no
+    // signal that the composer itself is the problem.
+    const t = await this._importNamespace("Lexical").catch(err => {
+      // COMPOSER-WEDGE: fall back to direct DOM typing instead of dying when
+      // Lexical is missing. See _enterMessageLegacy for the gating rationale.
+      this.log({
+        type: "[composer] Lexical unavailable — legacy DOM typing fallback",
+        data: { error: String(err?.message || err) }
+      });
+      return null;
+    }),
+      n = t ? document.querySelector('div[contenteditable="true"]')?.__lexicalEditor : null;
+    if (!t) {
+      await this._enterMessageLegacy({ text: e });
+      return;
+    }
+    if (!n) throw new ExtensionError({
+      type: "composer_bridge_error",
+      message: "Composer unavailable: no Lexical editor mounted (contenteditable missing)"
+    });
     await this._waitForEditable(n);
     // RESCUE SIGNAL: full-text match only. A prefix check here once allowed
     // early-return after 16 chars — silently truncating long messages.
@@ -719,14 +773,62 @@ class ADBlockDOM {
         clearTimeout(s), e()
       })
     });
-    for (const r of e) {
+    // THROTTLE-PROOF v2 (1.4.21): one decision per send, now MEASURED instead
+    // of trusted. document.hidden lies for occluded windows — macOS marks a
+    // fully covered window occluded, Chrome clamps its timers to ~1 tick/sec,
+    // yet the tab is still the active tab in its window so document.hidden
+    // stays false. That exact case (client Mac bundle 09-16: every long
+    // first_dm died with "domConnector timeout after 120000ms: enterMessage"
+    // while short followups on the same tab passed, and "it only sends if I
+    // am on the tab") is caught by probing what a 100ms timer ACTUALLY does:
+    // a healthy page answers in ~100-200ms; a throttled one in ~900-1100ms.
+    // Batched phrase inserts (~18x fewer timer ticks, see
+    // _segmentThrottledText) then finish typing in seconds — inside the 120s
+    // bridge ceiling — with a byte-identical editor result. A visible,
+    // unthrottled tab keeps the exact per-char human cadence: nothing a
+    // watching user (or Instagram) could observe changes.
+    const t0 = Date.now();
+    await new Promise((r) => setTimeout(r, 100));
+    const _driftStartMs = Date.now() - t0;
+    let _segmentThrottled = document.hidden === true || _driftStartMs >= 250;
+    this.log({
+      type: "typing_mode_selected",
+      data: { mode: _segmentThrottled ? "batched" : "perchar", driftMs: _driftStartMs, documentHidden: document.hidden === true, textLen: String(e).length }
+    });
+    let _charsLeft = String(e).length;
+    let _insertsSinceCheck = 0;
+    const _units = _segmentThrottled ? this._segmentThrottledText(e) : e;
+    for (const r of _units) {
       if (inputHasText()) return;
+      // MID-TYPING RE-CHECK: the window can be covered AFTER typing started
+      // unthrottled. Every 10 inserts, re-measure drift once (~1s worst case
+      // when throttled, ~0.1s when healthy) and flip the remaining text to
+      // batched mode. Every insert is independent and the full-text
+      // inputHasText() rescue governs correctness either way, so a mid-flip
+      // is safe by construction.
+      if (!_segmentThrottled && ++_insertsSinceCheck >= 10) {
+        _insertsSinceCheck = 0;
+        const m0 = Date.now();
+        await new Promise((r2) => setTimeout(r2, 100));
+        const drift = Date.now() - m0;
+        if (drift >= 250) {
+          _segmentThrottled = true;
+          this.log({
+            type: "typing_mode_flipped",
+            data: { from: "perchar", to: "batched", driftMs: drift, charsLeft: _charsLeft }
+          });
+        }
+      }
+      _charsLeft -= r.length;
       let ok = !1;
       for (let a = 0; a < 3 && !ok; a++) {
         try {
           await s(() => {
-            var e = r.charCodeAt(0),
-              e = 13 === e || 10 === e ? t.$createLineBreakNode() : t.$createTextNode(r);
+            var e = _segmentThrottled
+              ? ("\n" === r ? t.$createLineBreakNode() : t.$createTextNode(r))
+              : (13 === r.charCodeAt(0) || 10 === r.charCodeAt(0)
+                  ? t.$createLineBreakNode()
+                  : t.$createTextNode(r));
             t.$insertNodes([e])
           }), ok = !0
         } catch (err) {
@@ -735,6 +837,37 @@ class ADBlockDOM {
         }
       }
       await new Promise(e => setTimeout(e, Math.floor(101 * Math.random()) + 50))
+    }
+    this.log({
+      type: "typing_done",
+      data: { mode: _segmentThrottled ? "batched" : "perchar", elapsedMs: Date.now() - t0 }
+    });
+  }
+  async _enterMessageLegacy({
+    text: e
+  }) {
+    // COMPOSER-WEDGE fallback: direct DOM typing for pages whose Lexical
+    // namespace never loads (migrated builds, aggressive page experiments).
+    // GATED: _enterMessage calls this only after a CONFIRMED Lexical import
+    // failure — on a healthy page this code never runs, so the human-cadence
+    // Lexical path remains the only thing Instagram can ever observe.
+    const box = document.querySelector('div[contenteditable="true"]');
+    if (!box) throw new ExtensionError({
+      type: "composer_bridge_error",
+      message: "Composer unavailable: no contenteditable box for legacy typing"
+    });
+    box.focus();
+    // Mirror Lexical's input rules: newline → Enter, everything else text.
+    const parts = String(e).split("\n");
+    for (let i = 0; i < parts.length; i++) {
+      if (i > 0) {
+        document.execCommand("insertLineBreak");
+        await new Promise(r => setTimeout(r, Math.floor(101 * Math.random()) + 50));
+      }
+      const seg = parts[i];
+      if (!seg) continue;
+      document.execCommand("insertText", false, seg);
+      await new Promise(r => setTimeout(r, Math.floor(101 * Math.random()) + 50));
     }
   }
   async _sendMessage() {
@@ -1032,22 +1165,40 @@ class ADBlockDOM {
     // instead of 15-30s — a 15s failure inside waitForViewerReady's poll loop
     // made every poll overrun the deadline and stretched init to 30-47s.
     for (let e = 0; e < _maxAttempts; e++) {
-      var s = importNamespace(t);
+      var s = null;
+      try { s = importNamespace(t); } catch (_e) { s = null; }
       if (s) return s;
       await this.sleep(1e3)
     }
-    throw new Error("Module not found")
+    // COMPOSER-WEDGE (2026-09-14, client Mac/Chrome 152): a THROWING import
+    // shim used to bubble out of this loop on attempt 1 and — critically —
+    // straight through the domConnector dispatcher, which treats a throw as
+    // an error RESPONSE... unless the very first call throws during page
+    // boot, in which case no dispatcher is registered to catch it and the
+    // caller waits out its full ceiling in silence (content.js enterMessage:
+    // 120s of nothing, 3 first_dm tasks failed with 0 bytes typed). Both
+    // imports are polled here; a page whose module system is up but broken
+    // now fails in ~15s with a TYPED error instead of a silent 120s wedge.
+    throw new ExtensionError({
+      type: "composer_bridge_error",
+      message: `Module not found: ${t} (page module system unavailable)`
+    });
   }
   async _importDefault(t, _maxAttempts = 15) {
     // _maxAttempts: same rationale as _importNamespace — hot-path callers pass
     // a small bound so a module that will never appear fails in seconds, not
-    // 15-30s of bridge round-trips.
+    // 15-30s of bridge round-trips. Polled + typed for the same reason: the
+    // raw shim throwing on first call used to wedge the whole bridge.
     for (let e = 0; e < _maxAttempts; e++) {
-      var s = importDefault(t);
+      var s = null;
+      try { s = importDefault(t); } catch (_e) { s = null; }
       if (s) return s;
       await this.sleep(1e3)
     }
-    throw new Error("Module not found")
+    throw new ExtensionError({
+      type: "composer_bridge_error",
+      message: `Module not found: ${t} (page module system unavailable)`
+    });
   }
   async _getUser() {
     // ADDL-FAST-01: ask the Relay store first — it answers in milliseconds and

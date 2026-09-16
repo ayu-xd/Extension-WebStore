@@ -42,6 +42,15 @@
     .sep { border:none; height:1px; background:var(--line); width:72%; margin:12px auto 16px; }
     .card-num  { font-size:40px; line-height:1; }
 
+    /* ── next-DM countdown strip (hidden V.A. gesture) ──
+       Revealed by tapping the "Pending today" card 7× within 4s. */
+    .next-send { display:none; margin:-4px auto 14px; padding:9px 10px; background:var(--card);
+      border:1px solid var(--line); border-radius:var(--radius); text-align:center; }
+    .next-send.visible { display:block; }
+    .next-send-label { font-size:11px; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); }
+    .next-send-time { font-size:20px; font-weight:700; margin-top:2px; }
+    .next-send-why { font-size:11px; color:var(--muted); margin-top:2px; }
+
     /* ── engine toggle ── */
     .full-btn { width:100%; padding:15px 0; border:none; border-radius:var(--radius);
       font-size:14px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
@@ -71,6 +80,18 @@
     /* ── connecting / link state ── */
     .center-note { text-align:center; padding:30px 6px 10px; font-size:13.5px; color:var(--muted); }
 
+    /* ── takeover waiting banner (reinstall pairing) ──
+       Shown when this browser is online but another row's live lease still
+       holds the Instagram account. Without it that state is invisible. */
+    .takeover { background:var(--card); border-left:3px solid #f9a825; border-radius:var(--radius);
+      padding:12px 12px 12px 11px; margin-bottom:14px; }
+    .takeover-title { font-size:12.5px; font-weight:700; color:#f9a825; margin-bottom:5px; }
+    .takeover-text { font-size:12px; color:var(--muted); line-height:1.45; margin-bottom:10px; }
+    .takeover-btn { width:100%; padding:10px 0; background:#263238; color:#fff; border:1px solid var(--line);
+      border-radius:var(--radius); font-size:12.5px; font-weight:700; letter-spacing:.04em;
+      text-transform:uppercase; cursor:pointer; }
+    .takeover-btn:hover { background:#2e3b43; }
+    .takeover-btn.armed { background:var(--danger); border-color:var(--danger); }
     /* ── gear sheet ── */
     .sheet-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:9; }
     .sheet { position:fixed; right:0; top:0; bottom:0; width:86%; max-width:340px;
@@ -194,6 +215,12 @@
       <button id="gearBtn" class="icon-btn" title="Settings" aria-label="Settings">&#9881;</button>
     </div>
 
+    <div id="takeoverBanner" class="takeover hidden">
+      <div class="takeover-title">Waiting for @<span id="takeoverHandle"></span></div>
+      <p class="takeover-text" id="takeoverText"></p>
+      <button id="takeoverBtn" class="takeover-btn">Take it over now</button>
+    </div>
+
     <div class="cards">
       <div class="qcard">
         <div class="card-label">Sent today</div>
@@ -205,6 +232,12 @@
         <hr class="sep">
         <div class="card-num" id="pendingTodayDisplay">0</div>
       </div>
+    </div>
+
+    <div id="nextSendStrip" class="next-send">
+      <div class="next-send-label">Next DM</div>
+      <div class="next-send-time" id="nextSendTime">—</div>
+      <div class="next-send-why" id="nextSendWhy"></div>
     </div>
 
     <button id="engineToggleBtn" class="full-btn running">Press to stop</button>

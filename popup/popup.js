@@ -19,6 +19,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   const sentTodayDisplay = $('sentTodayDisplay');
   const pendingTodayDisplay = $('pendingTodayDisplay');
 
+  // ── next-DM countdown (V.A. gesture reveal) ──
+  const nextSendStrip = $('nextSendStrip');
+  const nextSendTime = $('nextSendTime');
+  const nextSendWhy = $('nextSendWhy');
+  const pendingCard = pendingTodayDisplay ? pendingTodayDisplay.closest('.qcard') : null;
+  let nextSendVisible = false;
+  let nextSendData = null;
+  let nextSendTickTimer = null;
+  let nextSendTickCount = 0;
+
   const imageUploadInput = $('imageUploadInput');
   const selectImagesBtn = $('selectImagesBtn');
   const clearImagesBtn = $('clearImagesBtn');
@@ -31,6 +41,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   const logsOverlay = $('logsOverlay');
   const logsCloseBtn = $('logsCloseBtn');
   let autoScrollLogs = true;
+
+  // ── takeover waiting banner refs (declared up here so nothing that runs
+  //    earlier — renderAuthView -> showActiveView -> refreshTakeover — can hit
+  //    a temporal-dead-zone on them) ──
+  const takeoverBanner = $('takeoverBanner');
+  const takeoverHandle = $('takeoverHandle');
+  const takeoverText = $('takeoverText');
+  const takeoverBtn = $('takeoverBtn');
+  let takeoverArmed = false;
+  let takeoverArmTimer = null;
 
   let state;
   try {
@@ -73,19 +93,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // ── view switching (single source of truth) ──
+  // One screen at a time. Every show*View() used to hide only SOME of the
+  // other screens, and none of them hid consentView: clicking "Continue" on
+  // the consent screen left it rendered above the login form, so the popup
+  // grew to two screens tall and looked like it panned/glitched.
+  const ALL_VIEWS = [consentView, loginView, selectView, activeView, logsOverlay];
+  function showOnlyView(view) {
+    for (const v of ALL_VIEWS) v.classList.toggle('hidden', v !== view);
+  }
+
   function showConsentView() {
-    loginView.classList.add('hidden');
-    selectView.classList.add('hidden');
-    activeView.classList.add('hidden');
-    logsOverlay.classList.add('hidden');
-    consentView.classList.remove('hidden');
+    showOnlyView(consentView);
   }
 
   function showLoginView() {
-    selectView.classList.add('hidden');
-    activeView.classList.add('hidden');
-    logsOverlay.classList.add('hidden');
-    loginView.classList.remove('hidden');
+    showOnlyView(loginView);
     passwordInput.value = '';
     // Prefill the remembered email — after a web-app password reset the user
     // only needs to type their new password.
@@ -98,17 +121,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function showConnectingView() {
-    loginView.classList.add('hidden');
-    activeView.classList.add('hidden');
-    selectView.classList.remove('hidden');
+    showOnlyView(selectView);
     showMessage(selectMessage, 'Connecting this browser to your account...', '');
   }
 
   async function showActiveView(label) {
-    loginView.classList.add('hidden');
-    selectView.classList.add('hidden');
-    activeView.classList.remove('hidden');
+    showOnlyView(activeView);
+    refreshTakeover();
     refreshStatsFromBackground();
+    refreshNextSendOnShow();
     const data = await chrome.storage.local.get('enginePaused');
     updateEngineToggle(!!data.enginePaused);
   }
@@ -116,6 +137,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   renderAuthView();
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
+    if ('takeoverWaiting' in changes) {
+      renderTakeover(changes.takeoverWaiting.newValue || null);
+    }
     if (!AUTH_KEYS.some(k => k in changes)) return;
     renderAuthView();
   });
@@ -157,7 +181,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     // if the user fully logs out and starts a new session.
     await chrome.storage.local.remove([
       'accessToken', 'refreshToken', 'sessionExpired',
-      'enginePaused', 'wakeUpAt', 'consentGiven'
+      'enginePaused', 'wakeUpAt', 'consentGiven',
+      'takeoverBackoff', 'takeoverWaiting'
     ]);
     chrome.runtime.sendMessage({ type: 'HUB_DISCONNECT' });
     showLoginView();
@@ -213,6 +238,56 @@ document.addEventListener('DOMContentLoaded', async () => {
   sheetBackdrop.addEventListener('click', closeGear);
   backBtn.addEventListener('click', closeGear);
 
+  // ── takeover waiting banner (reinstall pairing) ──
+  // This browser can be fully online and still send nothing, because another
+  // row's LIVE LEASE still holds the Instagram account (a deleted extension's
+  // lease takes ~10 minutes to lapse). Before this the state was invisible: the
+  // engine just looked idle for 10+ minutes with no explanation.
+  function renderTakeover(waiting) {
+    clearTimeout(takeoverArmTimer);
+    takeoverArmed = false;
+    takeoverBtn.classList.remove('armed');
+    takeoverBtn.textContent = 'Take it over now';
+    takeoverBtn.classList.remove('hidden');
+
+    if (!waiting || !waiting.handle) {
+      takeoverBanner.classList.add('hidden');
+      return;
+    }
+    takeoverBanner.classList.remove('hidden');
+    takeoverHandle.textContent = waiting.handle;
+    const until = waiting.until ? new Date(waiting.until).toLocaleTimeString() : null;
+    takeoverText.textContent = until
+      ? `Another browser's lease on this account runs until ${until}. It reconnects by itself after that — or you can take it over right now.`
+      : `Another browser is holding this account. It reconnects by itself — or you can take it over right now.`;
+  }
+
+  async function refreshTakeover() {
+    const s = await chrome.storage.local.get('takeoverWaiting');
+    renderTakeover(s.takeoverWaiting || null);
+  }
+
+  takeoverBtn.addEventListener('click', () => {
+    // Two-step confirm rather than window.confirm(): a native dialog can steal
+    // focus and dismiss the popup before the click ever lands.
+    if (!takeoverArmed) {
+      takeoverArmed = true;
+      takeoverBtn.classList.add('armed');
+      takeoverBtn.textContent = 'Confirm — take over';
+      takeoverArmTimer = setTimeout(() => {
+        takeoverArmed = false;
+        takeoverBtn.classList.remove('armed');
+        takeoverBtn.textContent = 'Take it over now';
+      }, 6000);
+      return;
+    }
+    clearTimeout(takeoverArmTimer);
+    takeoverArmed = false;
+    takeoverBtn.classList.remove('armed');
+    takeoverBtn.textContent = 'Taking over...';
+    chrome.runtime.sendMessage({ type: 'HUB_FORCE_TAKEOVER' });
+  });
+
   // ── stats cards ──
   function renderStats(stats) {
     if (!stats) return;
@@ -247,6 +322,25 @@ document.addEventListener('DOMContentLoaded', async () => {
       showLoginView();
       showMessage(loginMessage, 'Your session expired. Log in again to continue.', 'error');
     }
+    if (msg.type === 'HUB_TAKEOVER_WAITING') {
+      renderTakeover({ handle: msg.handle, until: msg.until });
+    }
+    if (msg.type === 'HUB_TAKEOVER_DONE') {
+      takeoverBanner.classList.remove('hidden');
+      takeoverHandle.textContent = msg.handle || '';
+      takeoverText.textContent = 'Done — this browser owns the account now. Sending resumes on the next poll.';
+      takeoverBtn.classList.add('hidden');
+      setTimeout(() => { refreshTakeover(); }, 3500);
+    }
+    if (msg.type === 'HUB_TAKEOVER_FAILED') {
+      takeoverBanner.classList.remove('hidden');
+      takeoverText.textContent = `Couldn't take over: ${msg.error || 'unknown error'}`;
+      takeoverBtn.classList.remove('hidden');
+      takeoverBtn.textContent = 'Try again';
+    }
+    if (msg.type === 'WAKE_WAKEUP' && nextSendVisible) {
+      askNextSend();                   // engine woke → plan may have changed
+    }
     if (msg.type === 'DEBUG_LOG' && !logsOverlay.classList.contains('hidden')) {
       appendLog(`[${new Date().toLocaleTimeString()}] ${msg.msg}`);
     }
@@ -264,10 +358,95 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
+  // ── hidden gesture: tap "Pending today" 7× (within 4s) to reveal the
+  //    next-DM countdown on the main screen. V.A.-only — regular users never
+  //    discover it, and the strip stays display:none until then. ──
+  let cardTaps = 0, cardTapTimer = null;
+  if (pendingCard) {
+    pendingCard.addEventListener('click', () => {
+      cardTaps++;
+      clearTimeout(cardTapTimer);
+      cardTapTimer = setTimeout(() => { cardTaps = 0; }, 4000);
+      if (cardTaps >= 7) {
+        cardTaps = 0;
+        nextSendVisible = true;
+        nextSendStrip.classList.add('visible');
+        if (nextSendData) renderNextSend(nextSendData);
+        else askNextSend();
+        startNextSendTicker();
+      }
+    });
+  }
+
+  // ── next-DM countdown engine ──
+  // The background already knows when the next send may fire: every poll cycle
+  // persists wakeUpAt (+ WHY: schedule / floor / hours / backoff) via setWake().
+  // This is that planned gap, rendered locally — no new storage, no spam.
+  function fmtCountdown(ms) {
+    if (ms <= 0) return 'now';
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ${s % 60}s`;
+    const h = Math.floor(m / 60);
+    return `${h}h ${m % 60}m`;
+  }
+
+  function renderNextSend(data) {
+    if (!data || !data.nextSendAt) {
+      nextSendTime.textContent = 'no DM scheduled';
+      nextSendWhy.textContent = data && data.reason === 'paused' ? 'engine is paused' : '';
+      return;
+    }
+    nextSendTime.textContent = `in ~${fmtCountdown(data.nextSendAt - Date.now())}`;
+    nextSendWhy.textContent =
+      data.reason === 'paused'   ? 'engine paused' :
+      data.reason === 'schedule' ? 'waiting for its scheduled time' :
+      data.reason === 'hours'    ? 'outside working hours' :
+      data.reason === 'floor'    ? '3-min pacing floor' :
+      data.reason === 'backoff'  ? 'nothing due — polling' : '';
+  }
+
+  function askNextSend() {
+    chrome.runtime.sendMessage({ type: 'GET_NEXT_SEND' }, response => {
+      if (chrome.runtime.lastError) return;
+      if (!response || !response.nextSend) return;
+      nextSendData = response.nextSend;
+      renderNextSend(nextSendData);
+    });
+  }
+
+  function startNextSendTicker() {
+    if (nextSendTickTimer) return;
+    nextSendTickCount = 0;
+    nextSendTickTimer = setInterval(() => {
+      if (!nextSendVisible) {           // popup re-opened → strip hidden again
+        clearInterval(nextSendTickTimer);
+        nextSendTickTimer = null;
+        return;
+      }
+      if (nextSendData) renderNextSend(nextSendData);
+      if (++nextSendTickCount % 30 === 0) askNextSend();   // re-sync with the engine
+    }, 1000);
+  }
+
+  function refreshNextSendOnShow() {
+    if (!nextSendVisible) return;
+    startNextSendTicker();
+  }
+
   function openLogs() {
     logsOverlay.classList.remove('hidden');
     loadStoredLogsIntoDom();
     refreshStatsFromBackground();
+    // V.A. convenience: print the next-DM plan as a log line too.
+    askNextSend();
+    setTimeout(() => {
+      if (!nextSendData) return;
+      const when = nextSendData.nextSendAt ? new Date(nextSendData.nextSendAt).toLocaleTimeString() : '(none)';
+      const gap = nextSendData.nextSendAt ? fmtCountdown(nextSendData.nextSendAt - Date.now()) : '—';
+      appendLog(`[System] Next DM: in ~${gap} (at ${when}) — reason: ${nextSendData.reason || 'idle'}`);
+    }, 400);
   }
   logsCloseBtn.addEventListener('click', () => logsOverlay.classList.add('hidden'));
 

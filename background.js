@@ -775,6 +775,15 @@ async function _autoPairBrowserInner() {
       debugLog("[Pair] Linked, but engine stays paused by user.");
     } else {
       startEngine();
+      // LOGIN-STALL FIX: startEngine only creates alarms + polls. Username
+      // detection lives in the MAIN TAB's content script, and pollTasks only
+      // opens a tab when a task is due — but a fresh login has none (the
+      // scheduler can't assign to a row with no @handle). Without this, a new
+      // login showed "Press to stop" with no tab and detection stalled forever
+      // until the user pressed stop/start (HUB_RESUME opens the tab eagerly).
+      // Mirror the resume handler: pair + running engine = tab must exist.
+      // Idempotent — openTab reuses the live main tab when one already exists.
+      openTab('main').catch(err => debugLog(`Open tab error: ${err.message}`));
     }
     chrome.runtime.sendMessage({ type: "HUB_CONNECTED_SUCCESS", label: state.browserLabel, stats: state.stats }).catch(() => null);
   } catch (err) {
@@ -924,9 +933,27 @@ async function collectMessagesJob() {
 let _uniboxInFlight = false;
 let _uniboxLastSendAt = 0;
 let _uniboxInFlightTaskId = null;
+// UNIBOX-DEFER: when the IG session is dead (login wall), back off before
+// probing again instead of re-opening tabs every poll cycle. In-memory on
+// purpose — a worker restart costs one probe, not a stuck silence.
+let _uniboxDeferredUntil = 0;
 
 async function pollUniboxReplies() {
-  if (!state.browserId || !state.mainTabId) return;
+  // UNIBOX-MAIN-TAB-FREEDOM (v1.4.25): the main tab was never the delivery
+  // vehicle for replies — they send through the additional tab, which opens
+  // itself (sendTaskToContent → openTab creates when missing). The old
+  // main-tab gate made tab presence a proxy for "the session is alive" and
+  // silently blacked out replies whenever no campaign tab existed (overnight,
+  // post-campaign, after a teardown). Session liveness is now detected at the
+  // page level — UNIBOX-DEFER below checks for login walls before burning
+  // anything — so the gate shrinks to pairing only. Deliberately NOT gated
+  // on enginePaused: stopEngine has always kept unibox_poll alive, pause
+  // never blocked replies while a tab existed, and pausing campaigns must
+  // not strand conversations the user just typed. Free side effect: the
+  // 7-day expiry sweep below used to sit behind the old gate too, so stale
+  // replies now get cleaned up even when the browser idles tabless.
+  if (!state.browserId) return;
+  if (Date.now() < _uniboxDeferredUntil) return;
   if (_uniboxInFlight) return;
   // hot-lead pacing: ≥45s between consecutive automated sends
   if (Date.now() - _uniboxLastSendAt < 45000) return;
@@ -950,6 +977,29 @@ async function pollUniboxReplies() {
       await supabaseReq(`dm_tasks?id=in.(${ids})`, "PATCH", { status: "skipped", error_reason: "Not sent — your browser was offline for over 7 days, so this reply expired." });
       await supabaseReq(`ig_messages?dm_task_id=in.(${ids})&send_status=eq.queued`, "PATCH", { send_status: "failed", send_error: "Couldn't deliver — your browser was offline too long." });
       debugLog(`[Unibox] expired ${stale.length} stale reply task(s).`);
+    }
+
+    // 0.5 UNIBOX-REAPER: an MV3 worker death mid-delivery strands a reply at
+    // status=processing forever — the 7-day sweep above only looks at pending,
+    // and no campaign sweeper touches unibox tasks. A live delivery never
+    // exceeds a couple of minutes (claim → navigate → ping ladder → send →
+    // bookkeeping), so anything processing for >15 min is a corpse. Flip it
+    // back to pending; the next healthy cycle redelivers. claimed_at is the
+    // freshness key — our own in-flight claim is seconds old and can never
+    // reap itself.
+    const reaperCutoff = new Date(Date.now() - 15 * 60_000).toISOString();
+    const stranded = await supabaseReq(
+      `dm_tasks?select=id&task_type=eq.unibox_reply&browser_instance_id=eq.${state.browserId}&status=eq.processing&claimed_at=lt.${reaperCutoff}`
+    );
+    if (stranded?.length) {
+      const reaperIds = stranded.map(t => t.id).join(",");
+      await supabaseReq(`dm_tasks?id=in.(${reaperIds})&status=eq.processing`, "PATCH", {
+        status: "pending",
+        claimed_at: null,
+        error_reason: "Requeued — a previous delivery attempt was interrupted before the message could be confirmed."
+      });
+      await supabaseReq(`ig_messages?dm_task_id=in.(${reaperIds})&send_status=eq.sending`, "PATCH", { send_status: "queued" }).catch(() => { });
+      debugLog(`[Unibox] reaper requeued ${stranded.length} stranded processing reply(ies).`);
     }
 
     // 1. Claim the oldest due reply (FIFO). EGRESS-E1: narrowed columns —
@@ -981,6 +1031,33 @@ async function pollUniboxReplies() {
       }
       _uniboxInFlightTaskId = rt.id;
       await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}&send_status=eq.queued`, "PATCH", { send_status: "sending" });
+
+      // UNIBOX-DEFER (pre-dispatch): if any existing tab is sitting on a
+      // dead-end page (login wall / checkpoint / suspended), the IG session
+      // is dead. Delivering into it would burn both retries against a login
+      // screen and permanently fail a reply the user actually typed — the
+      // exact regression the old main-tab gate prevented by accident. Defer
+      // instead: task returns to pending, NO retry burned, bubble back to
+      // queued, and the poll backs off before probing again. Recovery is
+      // automatic the moment any real instagram.com page is up.
+      {
+        const oracleId = state.additionalTabId || state.mainTabId || null;
+        let deadReason = null;
+        if (oracleId) {
+          const ot = await chrome.tabs.get(oracleId).catch(() => null);
+          const ourl = String(ot?.url || "");
+          const dhit = DEAD_END_URL_MARKERS.find(m => ourl.includes(m));
+          if (dhit) deadReason = `session oracle tab ${oracleId} on ${dhit}`;
+        }
+        if (deadReason) {
+          await supabaseReq(`dm_tasks?id=eq.${rt.id}&status=eq.processing`, "PATCH", { status: "pending", claimed_at: null }).catch(e => debugLog(`[Unibox] defer patch failed: ${e.message}`));
+          await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}&send_status=eq.sending`, "PATCH", { send_status: "queued" }).catch(() => { });
+          _uniboxDeferredUntil = Date.now() + 30 * 60_000;
+          dlog("unibox_reply_deferred", { taskId: rt.id, reason: deadReason, backoffMinutes: 30 }, "warn");
+          debugLog(`[Unibox] reply ${rt.id} deferred — ${deadReason}. Probing again after backoff.`);
+          return;
+        }
+      }
 
       // resolve lead handle from contact relation
       let targetUsername = null;
@@ -1028,6 +1105,7 @@ async function pollUniboxReplies() {
       // `completed`, quarantine the task as a confirmed delivery rather than
       // leaving it processing for a scheduler to resend.
       _uniboxLastSendAt = Date.now();
+      _uniboxDeferredUntil = 0; // session proven alive — clear any defer backoff
       const completedAt = new Date().toISOString();
       try {
         const completed = await supabaseReq(`dm_tasks?id=eq.${rt.id}&status=eq.processing`, "PATCH", {
@@ -1107,7 +1185,28 @@ async function pollUniboxReplies() {
         err?.errorType === "user_not_found" ||
         /not found|does not allow|no thread id|handle missing/i.test(msg);
       const attempts = Number(rt.retry_count || 0);
-      if (!permanent && attempts < 2) {
+      // UNIBOX-DEFER (post-failure): the fresh-tab case the oracle above
+      // cannot see — no tab existed, one was opened, and Instagram bounced
+      // it to a login wall. If the delivery tab is now on a dead-end page,
+      // this failure is a dead session, not a bad thread: defer to pending
+      // WITHOUT burning a retry (the normal transient requeue would spend
+      // one, and after two the reply dies permanently).
+      let deadSessionDeferred = false;
+      if (!permanent && state.additionalTabId) {
+        const dt = await chrome.tabs.get(state.additionalTabId).catch(() => null);
+        const durl = String(dt?.url || "");
+        if (DEAD_END_URL_MARKERS.some(m => durl.includes(m))) {
+          await supabaseReq(`dm_tasks?id=eq.${rt.id}&status=eq.processing`, "PATCH", { status: "pending", claimed_at: null }).catch(e => debugLog(`[Unibox] defer patch failed: ${e.message}`));
+          await supabaseReq(`ig_messages?dm_task_id=eq.${rt.id}&send_status=eq.sending`, "PATCH", { send_status: "queued" }).catch(() => { });
+          _uniboxDeferredUntil = Date.now() + 30 * 60_000;
+          dlog("unibox_reply_deferred", { taskId: rt.id, reason: "delivery tab landed on dead-end page", backoffMinutes: 30 }, "warn");
+          debugLog(`[Unibox] reply ${rt.id} deferred — dead session detected post-failure. Probing again after backoff.`);
+          deadSessionDeferred = true;
+        }
+      }
+      if (deadSessionDeferred) {
+        // handled above — task is back to pending, no retry burned
+      } else if (!permanent && attempts < 2) {
         await supabaseReq(`dm_tasks?id=eq.${rt.id}`, "PATCH", {
           status: "pending",
           retry_count: attempts + 1,
@@ -1907,6 +2006,9 @@ async function setWake(reason, wakeMs, meta = {}) {
     wakeReason: reason,
     wakeTaskId: meta.taskId ?? null
   });
+  // V.A. countdown: if the popup strip is open, wake it so the ticking number
+  // re-syncs with the plan it just changed. Harmless when no popup is listening.
+  chrome.runtime.sendMessage({ type: 'WAKE_WAKEUP', reason }).catch(() => null);
 }
 
 // `enginePaused` has exactly one author: the user's popup toggle. It is STICKY —
@@ -2683,6 +2785,7 @@ const TASK_FAILURE_COPY = {
   thread_not_found: "Instagram didn't return the conversation for this lead, so we couldn't read or continue it. Nothing was sent.",
   thread_busy: "Another send was already in progress in this conversation, so we skipped this one to avoid a duplicate DM.",
   composer_empty_error: "Instagram cleared the message box before we could send, so nothing went out.",
+  composer_bridge_error: "Instagram's message box didn't respond on this device, so the message couldn't be typed. Nothing was sent — the lead stays in your queue. A browser restart (fully quit and reopen Chrome) usually fixes this.",
   send_unconfirmed_error: "We couldn't confirm Instagram accepted the message, so we stopped instead of risking a duplicate.",
   user_search_error: "Instagram's DM search didn't respond, so we couldn't open the chat. Nothing was sent.",
   user_click_error: "Instagram's DM search returned results but wouldn't open this lead's chat. Nothing was sent.",
@@ -2755,6 +2858,22 @@ const TAB_HEALTHY_FAILURE_CLASSES = new Set([
   "user_is_unreachable",
   "rate_limited_error"
 ]);
+
+// COMPOSER-WEDGE (2026-09-14 client Mac/Chrome-152 bundle): the page-world
+// composer handler stopped responding entirely — 120s of silence per typing
+// attempt, both attempts, every first_dm. Nothing was typed (proven by the
+// verified-send contract: the task never reached the send step), so the
+// failure is retry-safe. Without a class, it fell through as "unclassified":
+// retry DID happen on a fresh tab, but only after paying the full 120s
+// ceiling twice per lead (~5.5 min), and the dashboard showed a generic
+// error. Naming it: the typed error from the new bridge-ping/typed imports
+// lands here, gets fresh-tab retry semantics (same as today, but in ~15s),
+// and honest customer copy instead of the generic panel.
+//   teardown: close (default branch) — the tab IS the sick component.
+//   retry ceiling: default 1 — identical to the old unclassified behavior;
+//     if a whole machine is wedged (Chrome 152 case) both attempts fail and
+//     regeneration brings the lead back tomorrow, which is the correct
+//     long-run behavior for a client-side environment problem.
 
 // THROTTLE-02: dom.js and background.js grew two spellings for the same failure.
 // dom.js:948 names a 429 "rate_limited"; every decision in this file — the pacing
@@ -3701,10 +3820,85 @@ async function sendToContentLite(tabType, taskType, taskData) {
 // ---------------------------------------------------------------------------
 // Listeners
 // ---------------------------------------------------------------------------
-// TAKEOVER-BACKOFF store: handle -> backoff-until timestamp. Module scope so
-// the registerAccounts handler below shares it across invocations (declared
-// here, before the listener, so it exists before any message can arrive).
+// TAKEOVER-BACKOFF store: handle -> backoff-until timestamp, PERSISTED.
+// Module scope so the registerAccounts handler below shares it across
+// invocations (declared here, before the listener, so it exists before any
+// message can arrive).
+//
+// PHASE-1 (reinstall pairing): the server gate is now keyed on the row's LEASE
+// (expires_at = last_heartbeat_at + 10 min), not on a 20-minute heartbeat
+// window. A deleted extension cannot renew its lease, so its row reads as dead
+// within ~10 minutes instead of ~20. The local suppression mirrors that:
+// 12 min = 10-min lease + 2 min margin.
+//
+// Persisted, because an MV3 worker recycle used to wipe this map silently and
+// turn every tab init back into a network round-trip against a call the server
+// was going to refuse anyway.
+const TAKEOVER_BACKOFF_MS = 12 * 60_000;
 const _takeoverBackoff = {};
+// handle -> the `until` we already announced, so a suppressed retry loop logs
+// and notifies the popup ONCE per window instead of every 3 minutes.
+const _takeoverNotified = {};
+let _takeoverBackoffLoaded = null;
+
+async function loadTakeoverBackoff() {
+  if (_takeoverBackoffLoaded) return _takeoverBackoffLoaded;
+  _takeoverBackoffLoaded = (async () => {
+    try {
+      const stored = (await chrome.storage.local.get('takeoverBackoff')).takeoverBackoff || {};
+      const now = Date.now();
+      for (const [h, until] of Object.entries(stored)) {
+        if (until > now) _takeoverBackoff[h] = until;   // lazy sweep of expired entries
+      }
+    } catch (e) { }
+  })();
+  return _takeoverBackoffLoaded;
+}
+
+async function setTakeoverBackoff(handle) {
+  const until = Date.now() + TAKEOVER_BACKOFF_MS;
+  _takeoverBackoff[handle] = until;
+  try {
+    await chrome.storage.local.set({
+      takeoverBackoff: _takeoverBackoff,
+      takeoverWaiting: { handle, until }
+    });
+  } catch (e) { }
+  chrome.runtime.sendMessage({ type: 'HUB_TAKEOVER_WAITING', handle, until }).catch(() => null);
+  return until;
+}
+
+async function clearTakeoverBackoff(handle) {
+  delete _takeoverBackoff[handle];
+  delete _takeoverNotified[handle];
+  try {
+    const stored = (await chrome.storage.local.get('takeoverBackoff')).takeoverBackoff || {};
+    delete stored[handle];
+    await chrome.storage.local.set({ takeoverBackoff: stored });
+    await chrome.storage.local.remove('takeoverWaiting');
+  } catch (e) { }
+}
+
+// PHASE-2 (reinstall pairing): claim_ig_account REBINDS the row that already
+// owns the username instead of copying six tables onto a brand-new row, so the
+// row id, every campaign link, every task and every thread stay where they are.
+//
+// SQL and extension ship independently, so never assume the server is ahead:
+// fall back to pair_or_adopt_ig_username when the new function isn't installed.
+// Detection is deliberately narrow — a PGRST202/404 that NAMES the function.
+// A refusal (takeover_blocked_live) is a 400, does not name it, and rethrows.
+async function callPairRpc(payload) {
+  try {
+    return await supabaseReq(`rpc/claim_ig_account`, "POST", payload);
+  } catch (e) {
+    const msg = String(e && e.message ? e.message : e);
+    const notInstalled = /claim_ig_account/i.test(msg) &&
+      /(PGRST202|Could not find the function|404)/i.test(msg);
+    if (!notInstalled) throw e;
+    debugLog("[IG Detect] claim_ig_account not installed on the server yet — using pair_or_adopt_ig_username.");
+    return await supabaseReq(`rpc/pair_or_adopt_ig_username`, "POST", payload);
+  }
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "HUB_LOGIN") {
@@ -3746,6 +3940,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })();
     return true;
   }
+  if (message.type === "GET_NEXT_SEND") {
+    // V.A. countdown: the poll loop persists wakeUpAt + a reason on every cycle
+    // (schedule / floor / hours / backoff / retry / busy_backoff) and the pause
+    // toggle is authoritative, so this is the engine's own plan for the next
+    // send — read-only, no new state, no side effects.
+    (async () => {
+      try {
+        const pauseData = await chrome.storage.local.get('enginePaused');
+        const paused = !!pauseData.enginePaused;
+        const s = await chrome.storage.local.get(['wakeUpAt', 'wakeReason']);
+        const wakeUpAt = Number(s.wakeUpAt) || null;
+        const reason = paused ? 'paused' : (s.wakeReason || null);
+        // Show the pause state itself when nothing is scheduled; otherwise the
+        // earlier of (planned wake, now) so a stale past timestamp reads "now".
+        const nextSendAt = wakeUpAt ? Math.max(wakeUpAt, Date.now()) : null;
+        sendResponse({ ok: true, nextSend: { nextSendAt, reason, paused } });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
+  }
   if (message.type === "HUB_PAUSE_ENGINE") {
     debugLog("[Engine] Paused by user.");
     stopEngine();
@@ -3762,6 +3978,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     openTab('main').catch(err => debugLog(`Open tab error: ${err.message}`));
     sendResponse({ ok: true });
     return;
+  }
+
+  if (message.type === "HUB_FORCE_TAKEOVER") {
+    // The user's explicit "yes, that other row is my dead install — let me in".
+    // ONLY reachable from a confirm in the popup; nothing in the automation path
+    // ever passes p_force, so a genuinely live rival browser can never be stolen
+    // silently by the engine.
+    (async () => {
+      try {
+        if (!state.browserId) throw new Error("This browser isn't paired yet.");
+        const handle = String(state.browserLabel || "").replace(/^@/, "").trim().toLowerCase();
+        if (!handle) throw new Error("No Instagram account detected on this browser yet.");
+
+        // Keep the stored ig_user_id — the RPC would otherwise blank it.
+        const rows = await supabaseReq(`browser_instances?select=id,ig_user_id&id=eq.${state.browserId}`);
+        const igUserId = (rows && rows[0] && rows[0].ig_user_id) || null;
+
+        debugLog(`[IG Detect] Forced takeover requested by user for @${handle}.`);
+        const res = await callPairRpc({
+          p_new_browser_id: state.browserId,
+          p_ig_username: handle,
+          p_ig_user_id: igUserId,
+          p_force: true,
+        });
+        debugLog(`[IG Detect] Forced takeover result: ${JSON.stringify(res)}`);
+
+        const reusedId = res && typeof res === 'object' ? res.browser_id : null;
+        if (reusedId && reusedId !== state.browserId) {
+          state.browserId = reusedId;
+          await chrome.storage.local.set({ browserId: reusedId });
+        }
+        await clearTakeoverBackoff(handle);
+        await sendHeartbeat(true).catch(() => { });
+        chrome.runtime.sendMessage({ type: 'HUB_TAKEOVER_DONE', handle }).catch(() => null);
+        sendResponse({ ok: true });
+      } catch (err) {
+        debugLog(`[IG Detect] Forced takeover failed: ${err.message}`);
+        chrome.runtime.sendMessage({ type: 'HUB_TAKEOVER_FAILED', error: err.message }).catch(() => null);
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
   }
   // HUB_SESSION_SYNCED removed (firm-hold login): the extension never imports
   // tokens from the web app. Both clients own independent Supabase sessions.
@@ -3922,12 +4180,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     //
     // TAKEOVER-BACKOFF (module scope map below): when the RPC refuses with
     // takeover_blocked_live (handle alive on another live browser), we record
-    // a 25-min per-handle backoff and answer subsequent attempts locally WITHOUT
+    // a 12-min per-handle backoff and answer subsequent attempts locally WITHOUT
     // network or log spam. Content's retry loop (3 min per tab init) then burns
-    // ~8 local no-ops instead of hammering a call the server will refuse.
-    // 25 min = 20-min server gate + 5 min margin, so local suppression never
-    // outlasts the gate it mirrors. The extension never passes p_force — only
-    // a future dashboard confirm may.
+    // ~4 local no-ops instead of hammering a call the server will refuse.
+    // 12 min = 10-min LEASE (the server gate) + 2 min margin, so local
+    // suppression never outlasts the gate it mirrors. The automation never
+    // passes p_force — only an explicit user confirm in the popup may.
     if (taskType === "registerAccounts") {
       (async () => {
         try {
@@ -3958,23 +4216,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 }
 
                 // Takeover backoff: a live-elsewhere refusal parks this handle
-                // for 25 min (no network, no spam). Expired entries are lazy-swept.
+                // for 12 min (no network, no spam). Persisted, and expired entries
+                // are lazy-swept on load.
+                await loadTakeoverBackoff();
                 if ((_takeoverBackoff[igUsername] || 0) > Date.now()) {
-                  throw new Error(`takeover_blocked_live: backoff active for @${igUsername} (another live browser holds it)`);
+                  // Suppressed locally — no network. Announced once per window so
+                  // the popup can show WHY nothing is happening instead of stalling
+                  // silently for 10+ minutes.
+                  const _until = _takeoverBackoff[igUsername];
+                  if (_takeoverNotified[igUsername] !== _until) {
+                    _takeoverNotified[igUsername] = _until;
+                    debugLog(`[IG Detect] Waiting — @${igUsername} is held by another browser's live lease until ${new Date(_until).toLocaleTimeString()}.`);
+                    chrome.runtime.sendMessage({ type: 'HUB_TAKEOVER_WAITING', handle: igUsername, until: _until }).catch(() => null);
+                  }
+                  const _waitErr = new Error(`takeover_blocked_live: backoff active for @${igUsername} (another live browser holds it)`);
+                  _waitErr.takeoverWaiting = true;
+                  throw _waitErr;
                 }
                 for (const _h of Object.keys(_takeoverBackoff)) {
                   if (_takeoverBackoff[_h] <= Date.now()) delete _takeoverBackoff[_h];
                 }
 
-                // Atomic RPC: if another (stale) row of THIS user owns this IG
-                // account, it transfers campaigns/limits/outreach/pending tasks
-                // to our row, frees the stale row (ig_username NULL, inactive),
-                // then stamps our row. This is the PC→laptop takeover path.
-                // p_force is never passed: only a dashboard confirm may override
-                // a live-elsewhere refusal (server default false).
+                // Atomic RPC (see callPairRpc): if another row of THIS user owns
+                // this IG account it is given to our row — rebinding the existing
+                // row on claim_ig_account, or transferring campaigns/limits/
+                // outreach/pending tasks and then stamping ours on the Phase-1
+                // fallback. This is the PC→laptop takeover path.
+                //
+                // p_force is NEVER passed here. The engine must not be able to
+                // steal a live rival's lease; the only override is an explicit
+                // human confirm, via HUB_FORCE_TAKEOVER from the popup button.
                 let rpcResult;
                 try {
-                  rpcResult = await supabaseReq(`rpc/pair_or_adopt_ig_username`, "POST", {
+                  rpcResult = await callPairRpc({
                     p_new_browser_id: state.browserId,
                     p_ig_username: igUsername,
                     p_ig_user_id: igUserId,
@@ -3982,8 +4256,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 } catch (_rpcErr) {
                   const _msg = String(_rpcErr?.message || _rpcErr);
                   if (/takeover_blocked_live/.test(_msg)) {
-                    _takeoverBackoff[igUsername] = Date.now() + 25 * 60_000;
-                    debugLog(`[IG Detect] Takeover refused — @${igUsername} is live on another browser; backing off 25m (no ping-pong).`);
+                    const _until = await setTakeoverBackoff(igUsername);
+                    debugLog(`[IG Detect] Takeover refused — @${igUsername} is still leased by another browser; waiting until ${new Date(_until).toLocaleTimeString()} (no ping-pong).`);
                     throw _rpcErr;
                   }
                   // GHOST-ROW recovery: our cached browserId points at a row
@@ -4001,7 +4275,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     await chrome.storage.local.remove(["browserId", "browserLabel"]).catch(() => {});
                     await autoPairBrowser().catch(() => {});
                     if (state.browserId) {
-                      rpcResult = await supabaseReq(`rpc/pair_or_adopt_ig_username`, "POST", {
+                      rpcResult = await callPairRpc({
                         p_new_browser_id: state.browserId,
                         p_ig_username: igUsername,
                         p_ig_user_id: igUserId,
@@ -4014,6 +4288,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                   }
                 }
                 debugLog(`[IG Detect] RPC result: ${JSON.stringify(rpcResult)}`);
+
+                // PHASE-2: on 'reused' the server handed back the id of the row it
+                // rebound to us. That row — not the empty one we just created — now
+                // carries the handle, the campaign links and the entire task queue,
+                // so our cached identity must follow it. Without this every later
+                // write (heartbeat, task PATCH, completion) targets a deleted row.
+                const _reusedId = rpcResult && typeof rpcResult === 'object' ? rpcResult.browser_id : null;
+                if (_reusedId && _reusedId !== state.browserId) {
+                  debugLog(`[IG Detect] Row reused — following identity ${state.browserId} -> ${_reusedId}.`);
+                  state.browserId = _reusedId;
+                  await chrome.storage.local.set({ browserId: _reusedId });
+                  // Presence on the reused row: its lease may already have lapsed.
+                  await sendHeartbeat(true).catch(() => { });
+                }
+
+                await clearTakeoverBackoff(igUsername);
 
                 // Update the label to show the @handle
                 state.browserLabel = `@${igUsername}`;

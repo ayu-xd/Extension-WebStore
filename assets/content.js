@@ -2087,6 +2087,30 @@ class Instagram {
     //     prove Instagram committed the message.
     const norm = x => String(x ?? "").replace(/\s+/g, " ").trim();
     const expected = norm(t);
+    // BRIDGE-PING (COMPOSER-WEDGE, 2026-09-14 client bundle): the 2026-09-14
+    // Mac/Chrome-152 bundle showed the composer bridge accepting NOTHING —
+    // 120s of silence per enterMessage, x2 attempts, x3 leads — while the
+    // SAME bridge answered a relay name read six seconds earlier. A dead
+    // responder can never return an error; only a deadline can. So before
+    // paying the 120s ceiling, tap the bridge with a cheap read: a healthy
+    // page answers in well under a second, and a wedged one now fails in
+    // 5s as composer_bridge_error instead of 120s as an unclassified
+    // timeout — which lands the task in the fresh-tab retry ladder while
+    // the lead is still warm, instead of ~5.5 min later as a daily loss.
+    // Nothing has been typed or sent at this point, so the retry is
+    // duplicate-safe by construction.
+    try {
+      await this.domConnector.send("getMessageInput", {}, { timeoutMs: 5000 });
+    } catch (_pingErr) {
+      this.log({
+        type: "[bridgePing] composer bridge silent — failing fast for fresh-tab retry",
+        data: { error: String(_pingErr?.message || _pingErr), taskId: this.taskId ?? null }
+      });
+      throw new ExtensionError({
+        type: "composer_bridge_error",
+        message: `Composer bridge did not respond within 5s: ${_pingErr?.message || _pingErr}`
+      });
+    }
     let typed = "";
     for (let attempt = 0; attempt < 3; attempt++) {
       // F10 (amended): the old 45s guillotine cut long messages mid-flight under
@@ -2096,9 +2120,36 @@ class Instagram {
       // (Sep-08 bundle: 14.5 min of silence, 11 incidents). On timeout the
       // error propagates to the normal failure path (tab recovery + retry)
       // instead of freezing the worker until the 10-min watchdog.
-      await this.domConnector.send("enterMessage", {
-        text: t
-      }, { timeoutMs: 120000 });
+      // TIMEOUT RESCUE (1.4.21): a 120s enterMessage timeout is only fatal if
+      // the text did NOT land. If the full message is already in the composer
+      // (slow typing finished after the ceiling, or the response was lost),
+      // killing the task here burned a lead that was one click away from
+      // sending. Check the composer; if the full text landed, proceed to the
+      // send click. If not, rethrow with full context for the dump.
+      try {
+        await this.domConnector.send("enterMessage", {
+          text: t
+        }, { timeoutMs: 120000 });
+      } catch (_enterErr) {
+        let composerNow = "";
+        try { composerNow = await this.domConnector.send("getMessageInput", {}); } catch (_e) { }
+        const landed = norm(composerNow) === expected;
+        this.log({
+          type: "enterMessage_timeout_ctx",
+          data: {
+            error: String(_enterErr?.message || _enterErr),
+            charsInComposer: norm(composerNow).length,
+            expectedLen: expected.length,
+            fullTextLanded: landed,
+            documentHidden: typeof document !== "undefined" ? document.hidden : null
+          }
+        });
+        if (!landed) throw _enterErr;
+        this.log({
+          type: "[timeout-rescue] full text landed after timeout — proceeding to send click",
+          data: { taskId: this.taskId ?? null }
+        });
+      }
       await this.sleep(Helpers.rand(50, 150));
       typed = await this.domConnector.send("getMessageInput", {});
       if (norm(typed) === expected) break;
@@ -2134,13 +2185,25 @@ class Instagram {
     await this.domConnector.send("sendMessage", {});
     // Match the upstream extension's wait, then use this fork's stronger
     // DOM/store verifier. The verifier is anchored to the pre-send tail.
-    await this.sleep(5000);
+    // THROTTLE-AWARE VERIFY (1.4.21): the verifier's own sleeps are ALSO
+    // clamped on a throttled tab, so the fixed 5s settle was frequently the
+    // entire patience budget — a message that actually sent got marked
+    // send_unconfirmed_error and the retry later duplicated it (09-16 bundle,
+    // pedrojmeneses_ 11:03). When the tab is hidden — the only case where the
+    // clamp is real — give the verifier room to breathe: 20s settle instead
+    // of 5s. Visible tabs keep the fast 5s path unchanged.
+    const _verifyThrottled = typeof document !== "undefined" && document.hidden === true;
+    await this.sleep(_verifyThrottled ? 20000 : 5000);
     const verified = await this._checkMessageExists({
       dateBeforeSend: sentAt,
       isFirstMessageThread: hasPreSendSnapshot && beforeMessages.length === 0,
       text: typed,
       prevTailId: previousTailId,
       hasPreSendSnapshot
+    });
+    this.log({
+      type: "verify_result",
+      data: { verified: !!verified, waitedMs: _verifyThrottled ? 20000 : 5000, documentHidden: _verifyThrottled }
     });
     if (verified) {
       this.log({ type: "Outgoing message verified in thread", data: { previousTailId } });
