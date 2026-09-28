@@ -1204,7 +1204,7 @@
             .map((e) => this._formatData({ data: e, bs_caml_int64: r }))
             .find((e) => e.contextLine === t);
         } catch (e) {
-          return (console.warn("[ColdDMs] _alternativeSearchResultsMapping: ReStore unavailable, returning null", e), null);
+          return (console.warn("[DMDroid] _alternativeSearchResultsMapping: ReStore unavailable, returning null", e), null);
         }
       }
       async _clickOnUser({ threadId: t, userId: r }) {
@@ -1687,7 +1687,7 @@
         try {
           return (await this._getDatabase("contacts")).find((e) => e.secondaryName === t);
         } catch (e) {
-          return (console.warn("[ColdDMs] _getUserFromContacts: ReStore unavailable, returning null", e), null);
+          return (console.warn("[DMDroid] _getUserFromContacts: ReStore unavailable, returning null", e), null);
         }
       }
       _formatData({ data: t, bs_caml_int64: r }) {
@@ -1776,7 +1776,7 @@
         try {
           return await this._getAllMessagesUnsafe();
         } catch (e) {
-          return (console.warn("[ColdDMs] _getAllMessages: ReStore unavailable, returning empty", e), {});
+          return (console.warn("[DMDroid] _getAllMessages: ReStore unavailable, returning empty", e), {});
         }
       }
       // Locate the page's Relay environment via the React fiber tree. Cached; the
@@ -2021,7 +2021,7 @@
             });
           }
         } catch (e) {
-          console.warn("[ColdDMs] _getAllMessagesFromDOM error", e);
+          console.warn("[DMDroid] _getAllMessagesFromDOM error", e);
         }
         return e;
       }
@@ -2162,7 +2162,7 @@
           return { rows: _rows, tailId: _rows.length ? _rows[_rows.length - 1].mid : null };
         } catch (_) { return null; }
       }
-      // UNIBOX CAPTURE (ported from ColdDMs 26-Aug): aggregate live OffMsys
+      // UNIBOX CAPTURE (reference implementation 26-Aug): aggregate live OffMsys
       // rows into the shape the content-side harvester expects. Guards
       // (single thread, non-group) are applied by the caller.
       _collectThreadFromDOM() {
@@ -2179,7 +2179,7 @@
             outgoingSenderIds: uniq(rows.filter((r) => r.outgoing === true).map((r) => r.sender_user_id)),
           };
         } catch (e) {
-          console.warn("[ColdDMs] _collectThreadFromDOM error", e);
+          console.warn("[DMDroid] _collectThreadFromDOM error", e);
           return empty;
         }
       }
@@ -2194,7 +2194,7 @@
           };
         } catch (e) {
           return (
-            console.warn("[ColdDMs] _getDebugMessages: ReStore unavailable, returning empty", e),
+            console.warn("[DMDroid] _getDebugMessages: ReStore unavailable, returning empty", e),
             { users: [], contacts: [] }
           );
         }
@@ -2244,7 +2244,7 @@
       try {
         z.handleCommitFiberRoot(t, r);
       } catch (e) {
-        console.error("[ColdDMS] handleCommitFiberRoot patch error:", e);
+        console.error("[DMDroid] handleCommitFiberRoot patch error:", e);
       }
       return e;
     };

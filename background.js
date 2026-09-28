@@ -516,7 +516,7 @@ async function refreshAccessTokenSingleFlight() {
 // ---------------------------------------------------------------------------
 
 async function init() {
-  // Migration (v1.4.8): rate-limit cooldowns were removed for ColdDMs parity, but
+  // Migration (v1.4.8): rate-limit cooldowns were removed for reference parity, but
   // an install updating from <=1.4.7 may still carry { enginePaused: true,
   // enginePausedUntil: <future> } written by a cooldown. The auto-resume that
   // cleared it is gone, so without this the engine stays paused forever. The
@@ -1074,7 +1074,7 @@ async function pollUniboxReplies() {
 
       debugLog(`[Unibox] delivering reply to @${targetUsername} (task ${rt.id})`);
 
-      // Additional-tab delivery, ColdDMs-style: pre-navigate to the thread,
+      // Additional-tab delivery, reference-style: pre-navigate to the thread,
       // then sendMessageFromDialog (self-recovery + composer contract).
       const res = await sendTaskToContent(
         "additional",
@@ -2014,15 +2014,15 @@ async function setWake(reason, wakeMs, meta = {}) {
 // `enginePaused` has exactly one author: the user's popup toggle. It is STICKY —
 // it means "stop", and only the user may undo it.
 //
-// ColdDMs parity note: upstream has NO rate-limit pausing at all. Its isLimited
-// flag is written to the task row on the server (Colddms Latest/background.js:5895,
+// reference parity note: the reference implementation has NO rate-limit pausing at all. Its isLimited
+// flag is written to the task row on the server (reference background.js:5895,
 // :6065) and nothing client-side ever pauses the engine over it. Every cooldown
 // mechanism here was our own invention (PACING-01/THROTTLE-*), and on this account
 // the only thing that ever triggered it was the profile API we already removed
 // (5 calls, 5 x 429, 0 verdicts) — a 30-minute outage per unfindable handle, self
 // inflicted. Removed: pauseEngineForCooldown, enginePausedUntil, the auto-resume,
 // and both call sites. is_limited is still recorded on the task row exactly as
-// upstream records it, so the data survives; only the pausing is gone.
+// the reference implementation records it, so the data survives; only the pausing is gone.
 async function isEnginePaused(prefetched) {
   const data = prefetched || await chrome.storage.local.get('enginePaused');
   return !!data.enginePaused;
@@ -2187,7 +2187,7 @@ async function pollTasks() {
 
   try {
     // Check if the engine is paused by the user. The only author of this flag is
-    // the popup toggle — rate-limit cooldowns were removed for ColdDMs parity.
+    // the popup toggle — rate-limit cooldowns were removed for reference parity.
     const pauseData = await chrome.storage.local.get('enginePaused');
     if (await isEnginePaused(pauseData)) {
       debugLog(`[Poll] Engine paused by user, skipping.`);
@@ -2297,9 +2297,9 @@ async function pollTasks() {
       const result = await executeTask(task);
       dlog("task_execute_done", { taskId: task.id, taskType: task.task_type, elapsedMs: Date.now() - taskStartedAt });
 
-      // ColdDMs parity: isLimited is recorded on the task row (executeTask's
+      // reference parity: isLimited is recorded on the task row (executeTask's
       // success payloads carry is_limited) and nothing pauses over it — the
-      // engine keeps running exactly as upstream does.
+      // engine keeps running exactly as the reference implementation does.
       if (result?.skippedReply) {
         await supabaseReq(`dm_tasks?id=eq.${task.id}`, "PATCH", {
           status: "skipped",
@@ -2358,8 +2358,8 @@ async function pollTasks() {
       //     enum shadow the class, so on a genuinely unreachable lead retryClass was
       //     "UNREACHABLE_USER_TYPE" and not one of those five comparisons could
       //     match — the tab was destroyed and three attempts were burned on a lead
-      //     that had already said no. Upstream ColdDMs keeps the two in separate
-      //     parameters and tests only errorType (Colddms Latest/background.js:6214);
+      //     that had already said no. the reference implementation reference keeps the two in separate
+      //     parameters and tests only errorType (reference background.js:6214);
       //     this restores that separation.
       //   copyClass — the PROSE key, and nothing else. TASK_FAILURE_COPY carries
       //     per-enum customer sentences that the generic class name would flatten,
@@ -2394,16 +2394,16 @@ async function pollTasks() {
         message: String(err.message || err).slice(0, 300)
       }, "error");
 
-      // F-BUSY-02: ColdDMs' teardown ladder, ported from its background.js:6214, and
+      // F-BUSY-02: reference teardown ladder, ported from its background.js:6214, and
       // deliberately hoisted ABOVE the branch chain so no failure class can slip past
       // it. The old code only navigated the main tab to the inbox, and only for five
       // dialog classes — every other failure left the content script alive with its
       // in-memory isBusy possibly still set, which is what the next task collided
-      // with. Upstream destroys the tab on EVERY error except user_is_unreachable,
+      // with. the reference implementation destroys the tab on EVERY error except user_is_unreachable,
       // because a destroyed content script cannot stay busy.
       //   user_is_unreachable    -> leave the tab alone (expected outcome, tab is fine)
       //   rate_limited_error     -> leave the tab alone (see TEARDOWN-02 below)
-      //   instagram_reload_error -> reload up to twice, then close (upstream's cap)
+      //   instagram_reload_error -> reload up to twice, then close (the reference implementation's cap)
       //   anything else          -> close; next openTab creates a fresh pinned tab
       //
       // TEARDOWN-02: rate_limited_error joins the exemption because the doctrine is
@@ -2413,7 +2413,7 @@ async function pollTasks() {
       // load moments after we were throttled, which is the opposite of what a
       // pacing failure asks for. The engine pauses below instead.
       if (TAB_HEALTHY_FAILURE_CLASSES.has(retryClass)) {
-        // Upstream's exemption: nothing about the tab is suspect here.
+        // the reference implementation's exemption: nothing about the tab is suspect here.
         dlog("teardown_decision", { tier: "exempt", retryClass, errorType: err.errorType || null, tabId: state.mainTabId || null });
       } else if (retryClass === "instagram_reload_error") {
         const rc = Number((await chrome.storage.local.get('reloadCounter')).reloadCounter || 0);
@@ -2496,11 +2496,11 @@ async function pollTasks() {
         // the tab is genuinely sick — and each re-fire is a fresh page load +
         // search burst for zero payoff. Failed leads come back tomorrow via
         // normal regeneration, which is the real retry. The dialog attempt
-        // itself is byte-identical to ColdDMs' _openUser (2 typed tries, 10
-        // result polls each, then user_click_error) — the DELTA from ColdDMs
+        // itself is byte-identical to reference _openUser (2 typed tries, 10
+        // result polls each, then user_click_error) — the DELTA from reference
         // was the fresh-tab retry for the search_missing_* classes, and the
         // 09-05 log shows what it bought on mrsclaudiaserra: a second tab,
-        // ~84s more dialog polling, the same zero results. ColdDMs fails the
+        // ~84s more dialog polling, the same zero results. reference fails the
         // task and lets the backend decide; our equivalent is fail + same-day
         // retire + tomorrow's scheduler cycle, which is the retry. So:
         //   • search_missing_alive keeps 1 fresh-tab retry — the profile API
@@ -2517,7 +2517,7 @@ async function pollTasks() {
         // E-04/P5 note: the old inbox-freshen block that lived here only covered
         // five dialog classes and only navigated the tab. It is superseded by the
         // F-BUSY-02 teardown ladder hoisted above the branch chain, which now runs
-        // for every failure class (see the comment there for the upstream rule).
+        // for every failure class (see the comment there for the the reference implementation rule).
 
         if (!isPermanentError && currentRetries < maxRetries) {
           const nextRetry = currentRetries + 1;
@@ -2554,10 +2554,10 @@ async function pollTasks() {
           // rate_limited_error deliberately falls through to the generic
           // else-if chain now: it is in isPermanentError (task row already
           // failed above with its own copy), the tab is exempt (TAB_HEALTHY_
-          // FAILURE_CLASSES), and ColdDMs parity says a rate limit never
+          // FAILURE_CLASSES), and reference parity says a rate limit never
           // parks a lead and never pauses the engine — isLimited is only
-          // ever recorded on the row, exactly as upstream does
-          // (Colddms Latest/background.js:5895, :6065). The profile API that
+          // ever recorded on the row, exactly as the reference implementation does
+          // (reference background.js:5895, :6065). The profile API that
           // produced every recorded 429 here is gone anyway (P9).
           if ((recordedType || retryClass === "search_missing_unproven") && task.contact_id) {
             // CHURN-05: the park and the retire are two different decisions now,
@@ -2757,14 +2757,14 @@ async function persistResolvedFullName(task, resolvedFullName) {
 //
 // IMPORTANT: the keys below are NOT new vocabulary. Every one is a type string
 // that already exists in this codebase. The 12 UNREACHABLE_*/REACHABLE_* keys
-// are Instagram's own reachability enum, inherited verbatim from upstream
-// ColdDMs (identical names and indices, assets/content.js:936). The remaining
+// are Instagram's own reachability enum, inherited verbatim from the reference implementation
+// reference (identical names and indices, assets/content.js:936). The remaining
 // keys are the ExtensionError `type` values that dom.js and content.js already
 // throw. Nothing here invents, renames or aliases a type — this is purely a
 // display layer over the existing ones, and any class that is missing from the
 // map falls through to the generic copy rather than leaking a raw message.
 const TASK_FAILURE_COPY = {
-  // --- Instagram reachability enum (upstream ColdDMs vocabulary, verbatim) ---
+  // --- Instagram reachability enum (the reference implementation reference vocabulary, verbatim) ---
   UNREACHABLE_USER_TYPE: "Instagram doesn't allow message requests to this kind of account. Nothing was sent.",
   UNREACHABLE_ADULT_TYPE: "Instagram blocked the message request to this account. Nothing was sent.",
   UNREACHABLE_INVITE_BLOCK: "Instagram wouldn't let a message request reach this account. Nothing was sent.",
@@ -2840,7 +2840,7 @@ function failureCopy(retryClass, { willRetry = false, attempt = 0, maxRetries = 
 // content.js:800/:1563 throw user_not_found, content.js:2214 and the two dialog
 // paths throw user_is_unreachable. The isPermanentError list further down also
 // names cannot_message_user and account_disabled, but nothing in this extension or
-// in upstream ColdDMs ever emits those two, so mapping them here would be
+// in the reference implementation reference ever emits those two, so mapping them here would be
 // inventing a vocabulary we don't have — if a future path does throw them they
 // fall through to the generic copy and the red bucket, which is the safe default.
 const PROVEN_UNREACHABLE_CLASSES = new Set([
@@ -3118,7 +3118,7 @@ async function executeTask(task) {
     const targetUsername = task.contacts?.username;
     if (!targetUsername) throw new Error("Missing target username in contact relation");
 
-    // Follow-ups use the ColdDMs thread-open path. The main tab opens DMs, then
+    // Follow-ups use the reference thread-open path. The main tab opens DMs, then
     // (because isOpenNewTab is set) calls findUserInDialogWithoutClick to scrape
     // the LIVE candidate.id off Instagram's freshly rendered search results,
     // always closes the search dialog, and hands off via sendMessageAdditionalTab.
@@ -3129,7 +3129,7 @@ async function executeTask(task) {
     // stored thread_id is a URL numeric id captured in a previous session, and
     // Instagram's open-check (_checkIfOpenUserRequired) compares it against the
     // live React store's thread_key — the two schemes don't always match, which
-    // caused the old false "Dialog is not opened" failures. ColdDMs re-derives a
+    // caused the old false "Dialog is not opened" failures. reference re-derives a
     // fresh id at send time; so do we. thread_id / assigned_thread_id remain
     // stored for observability only. targetUrl stays null so the MAIN tab does
     // not navigate — only the additional tab opens the live thread URL.
@@ -3402,12 +3402,12 @@ function randUrl() {
   return urls[Math.floor(Math.random() * urls.length)];
 }
 
-// F-LOAD-01: ColdDMs records the HTTP response of every Instagram main_frame load
+// F-LOAD-01: reference records the HTTP response of every Instagram main_frame load
 // (its background.js:6014 populating the `z` map) so openTab can tell a real page
 // from an error page. Chrome reports status:"complete" for a 429 rate-limit wall or
 // a 500 exactly as happily as for a good load, so without this we cannot tell
 // "Instagram said no" from "this lead does not exist" — which is how live handles
-// ended up parked as unreachable. In-memory only, like upstream: a suspended service
+// ended up parked as unreachable. In-memory only, like the reference implementation: a suspended service
 // worker loses the map, and a missing record always FAILS OPEN. Registered
 // defensively so the extension still runs if `webRequest` is dropped from the
 // manifest (the URL layer below keeps working without that permission).
@@ -3447,13 +3447,44 @@ function badTabLoadReason(tabId, startedAt, tabUrl) {
   const hit = DEAD_END_URL_MARKERS.find((m) => url.includes(m));
   if (hit) return `page landed on ${hit} (url=${url.slice(0, 120)})`;
   const rec = _mainFrameResponses[tabId];
-  // Only trust a response recorded AFTER this load began — upstream's `e < n`
+  // Only trust a response recorded AFTER this load began — the reference implementation's `e < n`
   // guard at background.js:6584. A stale record describes the previous page.
   if (!rec || !(startedAt < rec.date) || !rec.statusCode) return null;
   if (rec.statusCode < 200 || rec.statusCode >= 300) {
     return `Instagram returned HTTP ${rec.statusCode} for ${String(rec.url || url).slice(0, 120)}`;
   }
   return null;
+}
+
+// TAB-ALIVE-01: reference 22-Sept port (their background.js:6582/:6598).
+// keepTabAlive: forbid Chrome's Memory Saver from discarding our pinned worker
+// tab. A discarded tab means an UNLOADED content script — the "message channel
+// closed" / watchdog-death class of failure. Cost: the tab's memory stays
+// pinned; accepted by the reference implementation in production and strictly better than a corpse.
+// tabStateSnapshot: evidence instead of guesses — {status, discarded, frozen,
+// autoDiscardable} lets bundles separate "Chrome froze the tab" (alive, timers
+// dead — client-settings fix) from "Chrome killed the tab" (script unloaded).
+async function keepTabAlive(tabId) {
+  try {
+    await chrome.tabs.update(tabId, { autoDiscardable: false });
+  } catch (e) {
+    // Non-fatal: an unpinned tab still works until Chrome needs the memory.
+    dlog("tab_pin_failed", { tabId, error: String(e?.message || e).slice(0, 160) }, "warn");
+  }
+}
+
+async function tabStateSnapshot(tabId) {
+  try {
+    const t = await chrome.tabs.get(tabId);
+    return {
+      status: t.status || null,
+      discarded: Boolean(t.discarded),
+      frozen: Boolean(t.frozen),
+      autoDiscardable: Boolean(t.autoDiscardable)
+    };
+  } catch (e) {
+    return null; // tab gone — callers treat null as "no evidence available"
+  }
 }
 
 async function openTab(type, targetUrl = null) {
@@ -3516,6 +3547,11 @@ async function openTab(type, targetUrl = null) {
         }
       }
 
+        // TAB-ALIVE-01: re-assert the pin on every reuse — Chrome can reset
+        // autoDiscardable after a manual discard, and tabs created before this
+        // flag existed never had it. Cheap, idempotent, no navigation.
+        await keepTabAlive(tab.id);
+        dlog("tab_pinned", { tabType: type, tabId: tab.id, ...(await tabStateSnapshot(tab.id)) });
         // For the additional tab with no explicit target, force-navigate to the DM
         // inbox so we never reuse a stale thread page from a previous task. The
         // content script then opens the correct thread live by username.
@@ -3566,11 +3602,16 @@ async function openTab(type, targetUrl = null) {
     index: 0,
     pinned: true
   });
+  // TAB-ALIVE-01: pin AFTER creation. autoDiscardable is only accepted by
+  // tabs.update — passing it to tabs.create throws "Unexpected property"
+  // (Chrome 153, 2026-09-23 bundle) and killed every openTab. Mirrors the
+  // reference implementation exactly: create plain, then update.
+  await keepTabAlive(tab.id);
 
   state[stateKey] = tab.id;
   await chrome.storage.local.set({ [stateKey]: tab.id });
 
-  // F-LOAD-02: reset the reload ladder on a FRESH tab, mirroring upstream's
+  // F-LOAD-02: reset the reload ladder on a FRESH tab, mirroring the reference implementation's
   // background.js:6567. We only zeroed it when the ladder itself gave up and closed,
   // so a tab replaced by any other route (stored tab missing, wandered off IG, dead
   // after reloads) inherited a stale counter and skipped the cheap reload entirely.
@@ -3578,6 +3619,8 @@ async function openTab(type, targetUrl = null) {
 
   debugLog(`Tab opened (${type}): ${tab.id}, waiting for load...`);
   dlog("tab_created", { tabType: type, tabId: tab.id, url: tab.url || targetUrl || "random" });
+  // TAB-ALIVE-01: prove the pin took effect at birth.
+  dlog("tab_pinned", { tabType: type, tabId: tab.id, ...(await tabStateSnapshot(tab.id)) });
 
   for (let i = 0; i < 25; i++) {
     try {
@@ -3587,8 +3630,8 @@ async function openTab(type, targetUrl = null) {
     await sleep(400);
   }
 
-  // F-LOAD-01: upstream checks the HTTP code here and returns null on a bad load
-  // (background.js:6593). We THROW instead, because upstream's caller checks for
+  // F-LOAD-01: the reference implementation checks the HTTP code here and returns null on a bad load
+  // (background.js:6593). We THROW instead, because the reference implementation's caller checks for
   // null (:6192) and ours does not — sendTaskToContent would hand null straight to
   // chrome.tabs.sendMessage. Note errorType, NOT unreachableType: pollTasks parks
   // the contact as unreachable whenever err.unreachableType is set and retries are
@@ -3610,13 +3653,13 @@ async function openTab(type, targetUrl = null) {
   return tab.id;
 }
 
-// F-BUSY-02: ColdDMs' disposability primitive, ported from its background.js:6680.
+// F-BUSY-02: reference disposability primitive, ported from its background.js:6680.
 // Nulls the stored id BEFORE removing the tab, so even a failed remove leaves the id
 // forgotten and the next openTab creates a fresh pinned IG tab instead of hammering a
-// corpse. Closing the main tab also closes the additional tab, exactly as upstream
+// corpse. Closing the main tab also closes the additional tab, exactly as the reference implementation
 // does. This is the only reliable way to clear the content script's in-memory isBusy:
 // a lease can be extended, a flag in another world cannot be reached.
-// F-BUSY-02: mirrors upstream's closeAdditionalTab (background.js:6698). Same
+// F-BUSY-02: mirrors the reference implementation's closeAdditionalTab (background.js:6698). Same
 // null-then-remove order as closeMainTab, for the same reason.
 async function closeAdditionalTab(reason) {
   if (!state.additionalTabId) return;
@@ -3637,7 +3680,7 @@ async function closeAdditionalTab(reason) {
 }
 
 async function closeMainTab(reason) {
-  // Upstream's closeTab closes the additional tab first (background.js:6681).
+  // the reference implementation's closeTab closes the additional tab first (background.js:6681).
   await closeAdditionalTab(reason);
   if (!state.mainTabId) return;
   const tabId = state.mainTabId;
@@ -3670,6 +3713,16 @@ function sleep(ms) {
 async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) {
   const tabId = await openTab(tabType, targetUrl);
 
+  // TAB-ALIVE-01: re-assert the pin right before dispatch and record Chrome's
+  // view of the tab. Correlating tabFrozen:true on task_dispatched with
+  // send_unconfirmed outcomes is how we prove (or kill) the "frozen tab breaks
+  // verification" theory per client — with numbers, not anecdotes.
+  await keepTabAlive(tabId);
+  const _dispatchTabState = await tabStateSnapshot(tabId);
+  if (_dispatchTabState && (_dispatchTabState.frozen || _dispatchTabState.discarded)) {
+    dlog("tab_unhealthy_at_dispatch", { taskType, tabId, ..._dispatchTabState }, "warn");
+  }
+
   debugLog(`Sending '${taskType}' to tab ${tabId}`);
 
   // Ping first to confirm content script is alive
@@ -3699,10 +3752,29 @@ async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) 
         dlog("tab_gone_before_reload", { taskType, tabId, attempt: reloadCount }, "warn");
         break;
       }
+      // TAB-ALIVE-01: record WHY the ping failed (frozen? discarded? gone?)
+      // before touching anything — the reload decision becomes evidence-based.
+      const _preReloadState = await tabStateSnapshot(tabId);
       debugLog(`Content script not responding. Reloading tab (attempt ${reloadCount}/2)...`);
-      dlog("cs_unresponsive_reload", { taskType, tabId, attempt: reloadCount }, "warn");
-      await chrome.tabs.reload(tabId, { bypassCache: true });
-      await sleep(8000); // Wait for load
+      dlog("cs_unresponsive_reload", { taskType, tabId, attempt: reloadCount, tabState: _preReloadState }, "warn");
+      try {
+        await chrome.tabs.reload(tabId, { bypassCache: true });
+      } catch (reloadErr) {
+        dlog("tab_reload_failed", { taskType, tabId, attempt: reloadCount, error: String(reloadErr?.message || reloadErr).slice(0, 160) }, "warn");
+        await sleep(2000);
+        continue; // next ladder round re-verifies tab existence anyway
+      }
+      // TAB-ALIVE-01: poll for load completion instead of a blind 8s sleep —
+      // fast tabs proceed sooner, slow tabs get a bigger budget (25x400ms = 10s).
+      const _reloadStartedAt = Date.now();
+      let _loadSettled = false;
+      for (let _w = 0; _w < 25; _w++) {
+        const _t = await chrome.tabs.get(tabId).catch(() => null);
+        if (!_t) break;
+        if (_t.status === "complete") { _loadSettled = true; break; }
+        await sleep(400);
+      }
+      dlog(_loadSettled ? "tab_reload_wait_complete" : "tab_reload_wait_timeout", { taskType, tabId, attempt: reloadCount, waitedMs: Date.now() - _reloadStartedAt }, _loadSettled ? "info" : "warn");
     }
   }
 
@@ -3733,7 +3805,14 @@ async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) 
   }
 
   if (!pingOk) {
-    dlog("cs_dead_after_reloads", { taskType, tabId }, "error");
+    // TAB-ALIVE-01: full autopsy at the moment of death — the bundle now shows
+    // whether Chrome had frozen/discarded the tab, separating freeze deaths
+    // (client settings fix) from gone deaths (our bug).
+    const _deadState = await tabStateSnapshot(tabId);
+    dlog("cs_dead_after_reloads", { taskType, tabId, tabState: _deadState }, "error");
+    if (_deadState && (_deadState.frozen || _deadState.discarded)) {
+      dlog("tab_frozen_or_discarded_at_dead", { taskType, tabId, ..._deadState }, "error");
+    }
     // E-02 FIX: null the stored tab state so the NEXT openTab call creates a
     // fresh pinned IG tab instead of repeatedly failing against this dead tab.
     const deadTab = await chrome.tabs.get(tabId).catch(() => null);
@@ -3744,7 +3823,17 @@ async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) 
       await chrome.storage.local.remove(deadKey).catch(() => {});
       dlog("tab_url_invalid_nulled", { tabType, tabId, url: deadTab.url || null }, "warn");
     }
-    const errObj = new Error("Content script still not responding after tab reloads");
+    // TAB-ALIVE-01: distinct failure modes in the message (like the reference implementation's
+    // renamed strings) — but errorType stays byte-identical: the retry
+    // classifier and teardown ladder key off instagram_reload_error, and the
+    // customer-facing copy comes from the ERROR_COPY map, not this message.
+    const errObj = new Error(
+      _deadState?.discarded
+        ? "Content script dead: Chrome discarded the tab under memory pressure and reloads could not revive it"
+        : _deadState?.frozen
+          ? "Content script dead: Chrome had frozen the tab and reloads could not revive it"
+          : "Content script still not responding after tab reloads"
+    );
     // CHURN-07: was `unreachableType`, which is the exact mistake the F-LOAD-01
     // comment above warns about — pollTasks parks the contact whenever
     // err.unreachableType is set, so a dead content script in OUR tab was parking
@@ -3757,8 +3846,8 @@ async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) 
   }
 
   debugLog(`[sendTaskToContent] Sending actual task ${taskType} to tab ${tabId}...`);
-  // COLD-PACE-01: ColdDMs parity — their background sleeps 5s after a successful
-  // ping before dispatching the task (Colddms Latest/background.js:6398). The
+  // PACE-01: reference parity — their background sleeps 5s after a successful
+  // ping before dispatching the task (reference background.js:6398). The
   // ping proves the CONTENT script is alive, not the page world: ReactDev boots
   // a few seconds later on a cold tab, and a bridge call posted pre-boot is
   // dropped by postMessage with no error, hanging until the 30s cap (the
@@ -3780,7 +3869,7 @@ async function sendTaskToContent(tabType, taskType, taskData, targetUrl = null) 
       data: { type: taskType, data: taskData }
     });
     debugLog(`[sendTaskToContent] Task ${taskType} successfully sent. Response: ${JSON.stringify(response)}`);
-    dlog("task_dispatched", { taskType, tabId, ack: response ?? null });
+    dlog("task_dispatched", { taskType, tabId, ack: response ?? null, tabFrozen: _dispatchTabState ? _dispatchTabState.frozen : null });
     return response;
   } catch (err) {
     debugLog(`[sendTaskToContent] ERROR sending task ${taskType} to tab ${tabId}: ${err.message}`);
@@ -4107,7 +4196,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // sendMessageAdditionalTab: main-tab sendMessage couldn't open the thread,
     // so it delegated to us (fallback). Open the additional tab pointed at the
-    // thread's live URL and send from there — mirrors ColdDMs startTaskForAdditionalTab.
+    // thread's live URL and send from there — mirrors reference startTaskForAdditionalTab.
     if (taskType === "sendMessageAdditionalTab") {
       (async () => {
         try {

@@ -490,7 +490,7 @@ class Instagram {
       // 09-05 log). The binding it feeds is a one-time DB operation:
       // registerAccountsWithRetry owns it in the background and bound
       // @ayu.unlimited at attempts:1 in the same log, seconds after the gate
-      // cleared. ColdDMs never gated sends on this either — its init is a
+      // cleared. reference never gated sends on this either — its init is a
       // blind 7s sleep with no viewer check at all.
       this.log({ type: "[initMain] registerAccounts (background)", data: {} });
       this.registerAccountsWithRetry(null).catch(e => this.log({ type: "[initMain] registerAccounts error", data: { error: e?.message } }));
@@ -873,9 +873,9 @@ class Instagram {
             // answered HTTP 429 five times and 404 zero times, and since THROTTLE-01
             // every one of those 429s costs a 30-minute engine-wide cooldown we
             // caused ourselves. An empty DM search is now classified on its own as
-            // search_missing_unproven — see _searchMissedError. Upstream ColdDMs
+            // search_missing_unproven — see _searchMissedError. Reference reference
             // never verified a handle either: its single web_profile_info call
-            // (Colddms Latest/assets/dom.js:663) exists to fetch user.id and
+            // (reference dom.js:663) exists to fetch user.id and
             // followed_by_viewer so a thread can be opened, never to form a verdict.
             if (r) l = await this.domConnector.send("getUserByUsername", {
               username: e.username
@@ -928,7 +928,7 @@ class Instagram {
                 var _liveThreadId = h?.candidate?.id ?? null;
                 this.log({ type: "[Followup] Live thread id scraped from search results", data: { username: e.username, taskId: s, threadId: _liveThreadId, matched: !!h?.candidate } });
                 if (_liveThreadId) {
-                  // ColdDMs method: additional tab opens /direct/t/<liveId>/ directly
+                  // reference method: additional tab opens /direct/t/<liveId>/ directly
                   // and sends from the dialog there.
                   this.backgroundConnector.emit("sendMessageAdditionalTab", {
                     target: e,
@@ -941,14 +941,14 @@ class Instagram {
                   this.log({ type: "[Followup] Handoff emitted -> additional tab will open /direct/t/<id>/ and send", data: { taskId: s, threadId: _liveThreadId } });
                   return !0;
                 }
-                // Guard (F1): no usable id — ColdDMs would crash here on
+                // Guard (F1): no usable id — reference would crash here on
                 // candidate.id. Fall through to the proven main-tab openUser
                 // path below instead of handing off a blank id.
                 this.log({ type: "[Followup] No live thread id — falling back to main-tab send", data: { username: e.username, taskId: s } });
               }
               // F7/P7: the dialog search is the flaky step (fiber typing can
               // silently no-op -> 20 suggestion rows -> "No fiber match" ->
-              // timeout). It used to fall back to ColdDMs' profile route here.
+              // timeout). It used to fall back to reference' profile route here.
               // That route is gone: across every diagnostics session on record it
               // was attempted 8 times and succeeded 0 — "Received target user id"
               // never once appeared — so it only ever added a second API call and
@@ -1008,7 +1008,7 @@ class Instagram {
             });
             if (!g || ["0", "3"].includes(g.contact_reachability_status_type)) {
               // Reply guard (main tab). The `g?.messages?.length` precondition was
-              // removed (matches ColdDMs 27-Jul): on a freshly-opened tab the ReStore
+              // removed (matches reference 27-Jul): on a freshly-opened tab the ReStore
               // query layer often hasn't hydrated yet, so `g.messages` is empty and the
               // check used to be skipped entirely — firing a follow-up at someone who
               // already replied. checkResponseByReactAPI now falls back to the live DOM
@@ -2183,7 +2183,7 @@ class Instagram {
     const sentAt = Date.now();
 
     await this.domConnector.send("sendMessage", {});
-    // Match the upstream extension's wait, then use this fork's stronger
+    // Match the reference extension's wait, then use this fork's stronger
     // DOM/store verifier. The verifier is anchored to the pre-send tail.
     // THROTTLE-AWARE VERIFY (1.4.21): the verifier's own sleeps are ALSO
     // clamped on a throttled tab, so the fixed 5s settle was frequently the
@@ -2242,7 +2242,7 @@ class Instagram {
     //  - scrape fails → fall back to the username, never leak literal tokens.
     if (!t.includes("{{")) return { message: t, fullName: null };
     // N1: a server-supplied name WINS over the live lookup, exactly like
-    // ColdDMs (its content.js:637 checks e.fullName before calling the API).
+    // reference (its content.js:637 checks e.fullName before calling the API).
     // The lookup borrows Instagram's own importNamespace("PolarisInstajax")
     // loader and is the flakiest call in the whole send path, so every send
     // that can avoid it must. background.js filters username-placeholders out

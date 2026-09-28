@@ -1,6 +1,6 @@
 // ============================================================================
 // ReadReceipts.js — Reads read receipt data from Instagram's Relay store
-// Separate from ReactDev.js to avoid conflicts when diffing with Colddms
+// Separate from ReactDev.js to avoid conflicts when diffing with the reference version
 //
 // This script runs in the PAGE CONTEXT (same as dom.js / ReactDev.js)
 // It communicates with content.js via window.postMessage
